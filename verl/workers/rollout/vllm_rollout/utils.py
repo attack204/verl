@@ -41,6 +41,11 @@ VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
 
+# Cap on the densified tensors handed to one load_weights call while applying a
+# sparse delta. Densifying is full-shape, so this bounds the transient regardless
+# of how little of each parameter actually changed.
+DELTA_APPLY_CHUNK_BYTES = 512 << 20
+
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
     worker_local_rank = int(worker_local_rank)
@@ -322,13 +327,77 @@ class vLLMColocateWorkerExtension:
             apply_buffer_updates(model, buffer_updates)
         return loaded
 
+    def _apply_delta_flush(self, weights: list[tuple[str, torch.Tensor]]):
+        """Apply one sparse delta flush in place onto the live vLLM weights.
+
+        The flush arrives as the sentinel tensors the delta engine puts on the
+        wire. Each parameter is densified into a full-shape tensor whose unchanged
+        positions hold NaN, and vLLM's own ``load_weights`` is called with it so
+        that name mapping, tensor-parallel slicing and fused-projection splitting
+        stay in vLLM's hands; only the final ``copy_`` is narrowed to the changed
+        positions.
+
+        The masked context deliberately covers nothing but ``load_weights``:
+        ``process_weights_after_loading`` reads the weights back to derive fp8
+        scales and similar tensors, and must see fully written state. In this
+        worker that separation is structural -- post-load transforms run in
+        ``update_weights_from_ipc`` after every bucket has been applied.
+        """
+        import json
+
+        from verl.checkpoint_engine.delta_sync.apply import check_applied, decode_param, masked_copy
+        from verl.checkpoint_engine.delta_sync.encode import checksum as delta_checksum
+
+        tensors = dict(weights)
+        spec = json.loads(bytes(tensors["__delta_spec__"].cpu().numpy().tobytes()).decode())
+        values = tensors["__values__"]
+        positions = tensors.get("__positions__")
+        if positions is None:  # a values-only flush (the seed) carries no positions
+            positions = torch.empty(0, dtype=torch.uint8, device=values.device)
+
+        got = delta_checksum(positions, values)
+        if got != int(spec["checksum"]):
+            raise RuntimeError(
+                f"delta checksum mismatch in vllm worker: got {got}, expected {spec['checksum']}; "
+                "indicates corruption between sender encode and receiver apply"
+            )
+
+        dense_flush = spec["encoding"] == "dense"
+        # Every model the flush is applied to has to be inside the masked context,
+        # or an MTP drafter's writes would take the unmasked path.
+        models = list(self._iter_all_models())
+
+        with masked_copy(*models) as stats:
+            chunk: list[tuple[str, torch.Tensor]] = []
+            chunk_bytes = 0
+            for param in spec["params"]:
+                if dense_flush:
+                    dtype = getattr(torch, param["dtype"])
+                    tensor = values[param["val_start"] : param["val_end"]].to(dtype).view(param["shape"])
+                else:
+                    tensor = decode_param(spec["encoding"], positions, values, param)
+                nbytes = tensor.numel() * tensor.element_size()
+                if chunk and chunk_bytes + nbytes > DELTA_APPLY_CHUNK_BYTES:
+                    for model in models:
+                        model.load_weights(chunk)
+                    chunk, chunk_bytes = [], 0
+                chunk.append((param["name"], tensor))
+                chunk_bytes += nbytes
+            if chunk:
+                for model in models:
+                    model.load_weights(chunk)
+
+        check_applied(models, stats)
+
     def _update_weights(
         self,
         weights: list[tuple[str, torch.Tensor]],
         peft_config: dict,
         base_sync_done: bool,
     ):
-        if peft_config and base_sync_done:
+        if any(name == "__delta_spec__" for name, _ in weights):
+            self._apply_delta_flush(weights)
+        elif peft_config and base_sync_done:
             # Clone out of the receiver's reused IPC bucket buffer: add_lora keeps these tensors
             # past this callback, so views into the freed/overwritten buffer crash later (#6454).
             weights = {name: tensor.clone() for name, tensor in weights}

@@ -86,13 +86,17 @@ checkpoint engine (including the V1 ``separate_async`` trainer).
 - **Transport**: the sparse payload is broadcast over the existing NCCL collective group in
   bucket-sized flushes (streamed: each flush is sent and freed as it is produced, so sender peak
   memory stays ~2 buckets regardless of model size).
-- **Apply**: each rollout worker hands its local copy of the sparse payload to its colocated SGLang
-  TP worker via same-GPU ``update_weights_from_tensor`` IPC, where a verl-shipped loader —
-  registered automatically through SGLang's stock ``--custom-weight-loader`` hook, so **no SGLang
-  fork or patch is needed** — verifies the flush checksum (fail loud), densifies each parameter's
-  delta into a NaN-masked tensor, and overwrites only the changed positions *in place* on the live
-  weights. No full-model mirror is staged anywhere on the rollout side: receiver peak memory is one
-  bucket plus one decode chunk, independent of model size.
+- **Apply**: each rollout worker applies its local copy of the sparse payload *in place* on the live
+  weights — verify the flush checksum (fail loud), densify each parameter's delta into a NaN-masked
+  tensor, hand that to the engine's **own** weight loader, and let a patched ``Tensor.copy_`` narrow
+  the write to the changed positions. Name mapping, TP slicing and fused-projection splitting
+  therefore stay with the engine; only the final write is masked. **No engine fork or patch is
+  needed** either way: on SGLang the loader is registered through the stock
+  ``--custom-weight-loader`` hook and receives the payload over same-GPU
+  ``update_weights_from_tensor`` IPC, while on vLLM the rollout worker extension applies the flush
+  itself and the flush arrives as one bucket of CUDA IPC handles. No full-model mirror is staged
+  anywhere on the rollout side: receiver peak memory is one bucket plus one decode chunk,
+  independent of model size.
 - **Seeding**: the first sync is an explicit **dense** pass — the raw weights stream through the same
   bucketed wire with no positions attached (values only), populating the trainer-side snapshot as they
   go — so a dummy-initialized rollout gets a correct base without any sparse-encoding overhead.
@@ -154,6 +158,12 @@ materialization that grows linearly with parameter bytes, so the advantage widen
 and with MoE sparsity. The per-step changed ratio is ~1-3% of parameter bytes for dense models
 (0.02-0.05% for the 235B MoE early steps) and stays there over long runs.
 
+On the vLLM rollout, measured on A100/A800 (SM80) with Qwen3-8B GRPO under ``separate_async``
+(trainer 2 nodes + standalone rollout 1 node), same batch and token budget with only the backend
+changed: per-step weight sync 42.2 s (``nccl``) -> 3.6 s (``delta_sharded``), step time 82.8 s ->
+34.5 s, rollout/actor probs correlation unchanged at 0.999. Steady-state flushes touched 0.21-0.78%
+of elements (97-367 MB) against 15.3 GB for the dense seed.
+
 Correctness evidence (details in the PR):
 
 - **200-step GRPO equivalence at 7B** (delta vs nccl, 400 syncs): reward trajectories track
@@ -169,9 +179,16 @@ Correctness evidence (details in the PR):
 A runnable example is ``verl/experimental/one_step_off_policy/shell/grpo_0.6b_gsm8k_fsdp2_sglang_delta_sharded_2_6.sh`` —
 the SGLang 2+6 disaggregated GRPO recipe with ``backend=delta_sharded``.
 
-Current scope: disaggregated (``hybrid_engine=False``) + SGLang rollout in BF16, FSDP1/FSDP2 training engines.
-Selecting a delta backend with any other rollout engine raises ``NotImplementedError`` at worker startup;
-a per-backend apply interface (vllm/trt-llm plugins) is planned.
+Current scope: disaggregated (``hybrid_engine=False``) + SGLang or vLLM rollout in BF16, FSDP1/FSDP2
+training engines. Selecting a delta backend with any other rollout engine raises
+``NotImplementedError`` at worker startup; the remaining engines need the same per-backend apply and
+are planned.
+
+On vLLM the apply lives in the rollout worker extension rather than behind a loader hook, and the
+whole flush is passed by CUDA IPC handle, so IPC is required — the ``use_shm`` transport fallback is
+rejected explicitly rather than silently degrading. Note that a *colocated* topology cannot exercise
+this path at all: the V1 trainer overwrites ``checkpoint_engine.backend`` with ``naive`` when trainer
+and rollout share GPUs.
 
 ## Roadmap
 

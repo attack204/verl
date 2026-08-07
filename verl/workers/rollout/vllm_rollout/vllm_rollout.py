@@ -214,8 +214,8 @@ class ServerAdapter(BaseRollout):
         **kwargs,
     ):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
-        assert wire_format == "named_tensors", (
-            f"vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
+        assert wire_format in ("named_tensors", "delta_flush"), (
+            f"vLLM rollout consumes full named tensors or sparse delta flushes; got wire_format={wire_format!r}"
         )
         start_time = time.time()
 
@@ -231,7 +231,12 @@ class ServerAdapter(BaseRollout):
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
         )
-        await sender.async_send_weights(weights)
+        if wire_format == "delta_flush":
+            # One flush per bucket, passed by handle: the receiver recognises the
+            # sentinel names and applies the delta in place onto its live weights.
+            await sender.async_send_flushes(weights)
+        else:
+            await sender.async_send_weights(weights)
 
         if future is not None:
             await future

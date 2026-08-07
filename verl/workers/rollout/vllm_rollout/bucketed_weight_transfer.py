@@ -216,6 +216,57 @@ class BucketedWeightSender:
             get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
 
+    async def async_send_flushes(self, flushes):
+        """Send each sparse delta flush as one bucket of CUDA IPC handles.
+
+        The bucketed path cannot carry a flush: it packs tensors into a fixed
+        buffer by byte budget, so a flush's ``__delta_spec__`` / ``__positions__``
+        / ``__values__`` would be split across buckets and the receiver would see
+        values it has no manifest for. Nor is that avoidable by sizing -- with the
+        ``indices`` encoding the positions blob is 4 bytes per changed element
+        against 2 for a bf16 value, so a flush carries several times the bytes its
+        own bucket cap counted.
+
+        Handles sidestep the question entirely: each tensor is passed by reference,
+        the group always fits, and the receiver maps the sender's memory instead of
+        copying it. This requires IPC, which is what the colocated same-GPU
+        deployment the delta engine targets already uses.
+
+        Args:
+            flushes: iterable of ``(named_tensors, is_last)`` as produced by
+                ``CheckpointEngine.receive_weights``.
+        """
+        assert not self.use_shm, "the delta wire needs CUDA IPC; shared-memory fallback cannot pass tensors by handle"
+        try:
+            self._init_socket()
+            self._init_buffer()
+
+            sent_last = False
+            for named, is_last in flushes:
+                self._send_by_handle(named, is_last=is_last)
+                sent_last = sent_last or is_last
+            if not sent_last:
+                # An empty stream still has to release the receiver's loop.
+                self._send_by_handle([], is_last=True)
+        finally:
+            self._cleanup()
+
+    def _send_by_handle(self, named_tensors, is_last: bool):
+        """Send tensors by IPC handle as a single bucket."""
+        get_torch_device().synchronize()
+        bucket_meta: dict[str, TensorMetadata] = {
+            name: {
+                "name": name,
+                "shape": tensor.shape,
+                "dtype": tensor.dtype,
+                "offset": 0,
+                "handle": reduce_tensor(tensor.detach()),
+            }
+            for name, tensor in named_tensors
+        }
+        self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": is_last})
+        self.socket.recv()
+
     def _direct_send_large_weight(self, name: str, weight: torch.Tensor):
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
         logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
