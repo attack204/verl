@@ -117,8 +117,8 @@ The assembled delta is **bit-identical** to full-gather-then-diff, so the wire f
 checksum, and the rollout-side receiver are all unchanged. Each rank computes its shard's absolute
 position in the full flattened parameter purely locally (from the DTensor spec, no extra collective).
 
-**Supported training engines**: the shard export requires ``Shard(0)`` DTensor parameters, which both
-FSDP versions provide:
+**Supported training engines**: the shard export requires DTensor parameters whose local shard is one
+hyper-rectangular block of the full tensor, which both FSDP versions provide:
 
 - **FSDP2** (``fully_shard``, ``actor.strategy=fsdp2``): native DTensor params; the export never stages
   the whole shard on the GPU (``state_dict()`` is reference-only, shards move lazily per parameter).
@@ -128,7 +128,15 @@ FSDP versions provide:
   Single-GPU FSDP1 uses ``FULL_STATE_DICT`` (plain tensors) and degrades to the replicated/rank-0 path —
   still correct, just not shard-parallel.
 
-Other shard dimensions than ``Shard(0)`` are not supported and raise.
+**Tensor parallel (FSDP2 + TP)** works too. A colwise-parallel weight (q/k/v, gate/up, ``lm_head``)
+has TP cut dim 0 first and FSDP cut each TP chunk again, which FSDP2 expresses as
+``_StridedShard`` on its own mesh dim; a rowwise-parallel weight (``o_proj``, ``down_proj``) has TP
+cut dim 1 and stays ``Shard(0) x Shard(1)``. Both nest into one hyper-rectangular block per rank, so
+the local-to-global index translation is the same block math as the 1-D case. A ``_StridedShard``
+whose ``split_factor`` does not match the inner cut *would* interleave rather than nest; FSDP2 never
+builds that, and it raises rather than being silently mistranslated.
+
+HSDP + TP (a ``Replicate`` dim alongside several ``Shard`` dims) is not supported yet and raises.
 
 > **Config note**: the training engine reads the **top-level** ``actor_rollout_ref.actor.strategy``;
 > setting only ``actor.fsdp_config.strategy`` does *not* select FSDP2.

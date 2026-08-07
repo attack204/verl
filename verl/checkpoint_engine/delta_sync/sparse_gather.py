@@ -21,8 +21,10 @@ all-gather volume drops to the sparsity ratio (~1-3%) and rank 0 no longer needs
 full-model snapshot. The gathered result is bit-identical to the full-tensor diff, so the
 downstream encode + broadcast and the receiver are unchanged.
 
-Scope: FSDP2 ``Shard(0)`` DTensors (the common case) + replicated / non-DTensor params.
-Other shard dims are strided in the flattened layout and raise NotImplementedError.
+Scope: DTensors whose local shard is one hyper-rectangular block of the full tensor --
+FSDP2's ``Shard(0)`` (the common case), a sharded non-zero dim, and the FSDP2+TP
+combinations where the two cuts nest (see ``verl.workers.engine.spec``) -- plus
+replicated / non-DTensor params.
 """
 
 from __future__ import annotations

@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from verl.checkpoint_engine.delta_sync.sparse_gather import (
     gather_slot_entries_to_rank0,
@@ -99,6 +100,17 @@ def main():
         mesh2d = init_device_mesh("cuda", (world // 2, 2), mesh_dim_names=("fsdp", "sp"))
         for si, shape in enumerate([(4096, 1024), (7, 3), (128,)]):
             all_ok = _run_case(shape, [Shard(0), Replicate()], mesh2d, dev, rank, 50 + si) and all_ok
+
+    # 2D FSDP x TP mesh -- a colwise-parallel weight (q/k/v, gate/up) has TP cut dim 0
+    # first and FSDP cut each TP chunk again, which FSDP2 expresses as _StridedShard on
+    # its own dim; a rowwise weight (o_proj, down_proj) has TP cut dim 1 and stays a
+    # plain Shard(0) x Shard(1). Shapes must divide evenly: _StridedShard requires it.
+    if world % 2 == 0:
+        mesh_tp = init_device_mesh("cuda", (world // 2, 2), mesh_dim_names=("fsdp", "tp"))
+        for si, shape in enumerate([(4096, 1024), (128, 8)]):
+            colwise = [_StridedShard(0, split_factor=2), Shard(0)]
+            all_ok = _run_case(shape, colwise, mesh_tp, dev, rank, 100 + si) and all_ok
+            all_ok = _run_case(shape, [Shard(0), Shard(1)], mesh_tp, dev, rank, 150 + si) and all_ok
 
     if rank == 0:
         print("=" * 50)

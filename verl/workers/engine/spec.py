@@ -173,6 +173,51 @@ def translate_flat_indices(lidx: torch.Tensor, place: int | BlockPlacement) -> t
     return out
 
 
+def _is_strided_shard(placement) -> bool:
+    """Recognise ``_StridedShard`` across torch versions.
+
+    It subclassed ``Shard`` through torch 2.10, so ``is_shard()`` returned True;
+    since 2.11 it derives from ``Placement`` directly and ``is_shard()`` returns
+    False. Relying on ``is_shard()`` would therefore drop a strided mesh dim from
+    ``shard_dims`` on new torch and silently pick the single-Shard gather subgroup
+    -- losing every contribution from ranks outside it. Both spellings carry
+    ``split_factor``, which no other placement does.
+    """
+    return hasattr(placement, "split_factor")
+
+
+def _cuts_tensor(placement, tensor_dim: Optional[int] = None) -> bool:
+    """Does this placement shard the tensor (optionally: shard ``tensor_dim``)?"""
+    if not (placement.is_shard() or _is_strided_shard(placement)):
+        return False
+    return tensor_dim is None or int(placement.dim) == int(tensor_dim)
+
+
+def _inner_shard_factor(mesh: DeviceMesh, placements: tuple, mesh_dim: int, tensor_dim: int) -> int:
+    """How many pieces the mesh dims *inside* ``mesh_dim`` cut ``tensor_dim`` into.
+
+    ``_StridedShard(d, split_factor=sf)`` means "cut tensor dim ``d`` into ``sf``
+    pieces first, then cut each piece across this mesh dim" -- the ordering FSDP2
+    needs when an inner mesh dim (TP) shards the same tensor dim as the outer one
+    (FSDP). FSDP2 builds it with ``split_factor`` equal to the number of shards
+    the inner spec puts on that tensor dim (``_fsdp_param.py``: ``split_factor =
+    self._tp_spec.num_shards_map[shard_dim]``), i.e. exactly this product. Under
+    that equality the two cuts nest, so every rank owns one contiguous run of dim
+    ``d`` and ``compute_local_shape_and_global_offset`` describes it as a plain
+    block.
+
+    Any other ``split_factor`` interleaves the pieces instead of nesting them,
+    leaving a local tensor that is not a single block. Those combinations are not
+    reachable from FSDP2, but they are rejected explicitly rather than silently
+    mistranslated, because a ``BlockPlacement`` cannot represent them.
+    """
+    factor = 1
+    for d in range(mesh_dim + 1, len(placements)):
+        if _cuts_tensor(placements[d], tensor_dim):
+            factor *= mesh.size(d)
+    return factor
+
+
 def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, bool, Optional[ProcessGroup]]:
     """Derive ``(place, contributes, gather_group)`` for THIS rank from a spec
     whose distribution is fully declared by ``mesh`` + ``placements`` (or is
@@ -196,8 +241,11 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
       a distinct block, the gather group spans the whole mesh (created once and
       cached), and Replicate dims are not supported alongside them.
 
-    ``_StridedShard`` placements (interleaved local tensors, from some HSDP/TP
-    orderings) are rejected: the local tensor is not a single block.
+    ``_StridedShard`` (FSDP2 sharding the tensor dim an inner TP dim already cut,
+    e.g. a colwise-parallel weight under FSDP2+TP) nests rather than interleaves
+    as long as its ``split_factor`` matches the inner cut, and is then just
+    another block -- see :func:`_inner_shard_factor`. Mismatched split factors do
+    interleave and are rejected.
     """
     import torch.distributed as dist
 
@@ -207,13 +255,18 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
         return 0, (dist.get_rank() == 0 if dist.is_initialized() else True), None
 
     placements = spec.placements
-    for p in placements:
-        if type(p).__name__ == "_StridedShard":
+    for d, p in enumerate(placements):
+        if not _is_strided_shard(p):
+            continue
+        nested = _inner_shard_factor(spec.mesh, placements, d, p.dim)
+        if p.split_factor != nested:
             raise NotImplementedError(
-                f"sharded delta does not support _StridedShard (local tensor is not one block); "
-                f"got placements={placements}"
+                f"sharded delta does not support this _StridedShard (local tensor is not one block): "
+                f"placements[{d}]={p}, but the inner mesh dims cut tensor dim {p.dim} into {nested} "
+                f"piece(s), so the cuts interleave instead of nesting. FSDP2 only builds "
+                f"split_factor == {nested} here; got placements={placements}"
             )
-    shard_dims = [d for d, p in enumerate(placements) if p.is_shard()]
+    shard_dims = [d for d, p in enumerate(placements) if _cuts_tensor(p)]
 
     coord = spec.mesh.get_coordinate()
     contributes = True
@@ -234,7 +287,7 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
         return BlockPlacement(tuple(local_shape), tuple(global_offset), tuple(spec.full_shape)), contributes, group
 
     # several Shard dims: every rank owns a distinct block; gather spans the whole mesh.
-    assert all(p.is_shard() for p in placements), (
+    assert all(_cuts_tensor(p) for p in placements), (
         f"Replicate dims are not supported alongside multiple Shard dims; got placements={placements}"
     )
     group = _flattened_mesh_group(spec.mesh)
