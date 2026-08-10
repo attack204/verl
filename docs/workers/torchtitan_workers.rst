@@ -61,8 +61,9 @@ Enable it with ``model_engine=torchtitan``.
 
 - Sharded delta weight sync (``checkpoint_engine.backend=delta_sharded``) for
   disaggregated runs — see :doc:`../advance/delta_weight_sync`. Dense models under
-  FSDP2, optionally with HSDP replicate or context parallelism; TP, EP and PP are
-  rejected at the export boundary with a message naming which one.
+  FSDP2, optionally with tensor parallelism, HSDP replicate or context parallelism;
+  EP, PP and HSDP-replicate-with-TP are rejected at the export boundary with a
+  message naming which one.
 
 
 **Cons**

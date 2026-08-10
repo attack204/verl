@@ -132,9 +132,13 @@ FSDP versions and TorchTitan provide:
   the HF names coming from TorchTitan's own state dict adapter — for a dense model that adapter is a
   pure rename, so the DTensors reach the export with their placements intact. HSDP replicate and
   context parallelism need no special handling (TorchTitan folds CP into the ``fsdp`` mesh dim).
-  Tensor, expert and pipeline parallelism are rejected at the export boundary for now: TP shards the
-  same tensor dim FSDP2 already cut and so produces a ``_StridedShard`` placement, EP needs the
-  per-expert converter path, and PP gives each stage a disjoint slice of the model.
+  Tensor parallelism works too: a column-parallel weight has FSDP2 cutting the dim TP already cut,
+  which torch spells ``_StridedShard`` — still one block per rank, since the strided form permutes
+  which block a rank owns rather than interleaving it — and a row-parallel weight cuts a second dim
+  and is a plain second ``Shard``. Expert and pipeline parallelism are rejected at the export
+  boundary, as is HSDP replicate combined with TP: EP needs the per-expert converter path, PP gives
+  each stage a disjoint slice of the model, and HSDP-with-TP puts replicas alongside two cut dims,
+  which the whole-mesh gather group would count twice.
 
 Other shard dimensions than ``Shard(0)`` are not supported and raise.
 
