@@ -148,6 +148,48 @@ class BlockPlacement:
         return int(self.global_offset[0]) * _prod(self.full_shape[1:]) if self.full_shape else 0
 
 
+def _shard_dim(p) -> Optional[int]:
+    """Which tensor dim this placement cuts, or None if it cuts none.
+
+    ``p.is_shard()`` is not enough: ``_StridedShard`` moved to C++ in torch 2.13
+    and stopped subclassing ``Shard``, so it answers False there while still
+    cutting a dim. Getting this wrong is silent -- the mesh dim drops out of
+    ``shard_dims``, the gather group shrinks to the remaining dims, and the ranks
+    left out lose their contributions with no error. Both types expose ``.dim``.
+    """
+    if p.is_shard():
+        return int(p.dim)
+    return int(p.dim) if type(p).__name__ == "_StridedShard" else None
+
+
+def _assert_even_strided(spec: ShardSpec, placements: tuple) -> None:
+    """Strided offsets are only valid when the cut divides evenly.
+
+    Once any placement is strided, ``compute_local_shape_and_global_offset``
+    switches every tensor dim over to ``offset = local_shape * shard_idx``, which
+    assumes all shards are the same size -- so the check covers all of them, not
+    just the strided dim. Plain Shard placements never take that branch and keep
+    working unevenly, which is why this returns early without one. torch guards
+    this at DTensor construction ("_StridedShard currently only allows even
+    sharding"), but that guard is theirs to relax, and if it ever is, the failure
+    here would be a wrong offset rather than an exception -- so check it too.
+    """
+    if not any(type(p).__name__ == "_StridedShard" for p in placements):
+        return
+    cuts: dict[int, int] = {}
+    for mesh_dim, p in enumerate(placements):
+        tdim = _shard_dim(p)
+        if tdim is not None:
+            cuts[tdim] = cuts.get(tdim, 1) * spec.mesh.size(mesh_dim)
+    for tdim, total in cuts.items():
+        if spec.full_shape[tdim] % total:
+            raise NotImplementedError(
+                f"sharded delta does not support uneven strided sharding: tensor dim {tdim} "
+                f"has size {spec.full_shape[tdim]}, which {total} shards do not divide evenly "
+                f"(placements={placements})"
+            )
+
+
 def translate_flat_indices(lidx: torch.Tensor, place: int | BlockPlacement) -> torch.Tensor:
     """Map shard-local flat positions to full-tensor flat positions.
 
@@ -192,12 +234,17 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
       contribute and the gather group is the Shard dim's subgroup; the FSDP2
       default ``Shard(0)`` yields a flat-contiguous block, which keeps the add
       fast path in :func:`translate_flat_indices`. With several Shard dims (e.g.
-      automodel's EP x FSDP ``(Shard(0), Shard(1))`` expert mesh) every rank holds
-      a distinct block, the gather group spans the whole mesh (created once and
-      cached), and Replicate dims are not supported alongside them.
+      automodel's EP x FSDP ``(Shard(0), Shard(1))`` expert mesh, or FSDP2 x TP
+      cutting the same dim twice) every rank holds a distinct block, the gather
+      group spans the whole mesh (created once and cached), and Replicate dims
+      are not supported alongside them.
 
-    ``_StridedShard`` placements (interleaved local tensors, from some HSDP/TP
-    orderings) are rejected: the local tensor is not a single block.
+    ``_StridedShard`` (FSDP2 sharding a dim TP already cut) is a block too: it
+    encodes the right-to-left cut order, which permutes WHICH block a rank gets
+    rather than interleaving the block itself, and
+    ``compute_local_shape_and_global_offset`` already returns the permuted
+    offset. It only holds for an even cut, which :func:`_assert_even_strided`
+    checks.
     """
     import torch.distributed as dist
 
@@ -207,13 +254,8 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
         return 0, (dist.get_rank() == 0 if dist.is_initialized() else True), None
 
     placements = spec.placements
-    for p in placements:
-        if type(p).__name__ == "_StridedShard":
-            raise NotImplementedError(
-                f"sharded delta does not support _StridedShard (local tensor is not one block); "
-                f"got placements={placements}"
-            )
-    shard_dims = [d for d, p in enumerate(placements) if p.is_shard()]
+    shard_dims = [d for d, p in enumerate(placements) if _shard_dim(p) is not None]
+    _assert_even_strided(spec, placements)
 
     coord = spec.mesh.get_coordinate()
     contributes = True
@@ -234,7 +276,7 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
         return BlockPlacement(tuple(local_shape), tuple(global_offset), tuple(spec.full_shape)), contributes, group
 
     # several Shard dims: every rank owns a distinct block; gather spans the whole mesh.
-    assert all(p.is_shard() for p in placements), (
+    assert all(_shard_dim(p) is not None for p in placements), (
         f"Replicate dims are not supported alongside multiple Shard dims; got placements={placements}"
     )
     group = _flattened_mesh_group(spec.mesh)

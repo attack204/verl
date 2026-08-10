@@ -22,6 +22,8 @@ stubbed out.
     torchrun --nproc_per_node=4 tests/special_distributed/test_torchtitan_delta_export.py
 """
 
+from types import SimpleNamespace
+
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
@@ -53,6 +55,20 @@ class _ExportOnlyEngine(TorchTitanEngine):
 def _build_sharded_model(parallel_dims):
     """Build a torchtitan Qwen3 and parallelize it the way torchtitan itself does."""
     spec = tt_qwen3.model_registry(FLAVOR)
+    parallelism = ParallelismConfig(
+        data_parallel_shard_degree=parallel_dims.dp_shard,
+        data_parallel_replicate_degree=parallel_dims.dp_replicate,
+        tensor_parallel_degree=parallel_dims.tp,
+        context_parallel_degree=parallel_dims.cp,
+        pipeline_parallel_degree=parallel_dims.pp,
+        expert_parallel_degree=parallel_dims.ep,
+    )
+    # TP is applied per module from a sharding_config that the model config only
+    # grows once it has seen the parallelism config -- the trainer does this for
+    # real runs. Skip it and parallelize_fn still builds the tp mesh dim, but every
+    # weight stays replicated across it, so a TP case would pass without ever
+    # sharding a tensor two ways.
+    spec.model.update_from_config(config=SimpleNamespace(parallelism=parallelism))
     with torch.device("cuda"):
         model = spec.model.build()
     model.to(torch.float32)
@@ -60,14 +76,7 @@ def _build_sharded_model(parallel_dims):
         model,
         parallel_dims=parallel_dims,
         training=TrainingConfig(),
-        parallelism=ParallelismConfig(
-            data_parallel_shard_degree=parallel_dims.dp_shard,
-            data_parallel_replicate_degree=parallel_dims.dp_replicate,
-            tensor_parallel_degree=parallel_dims.tp,
-            context_parallel_degree=parallel_dims.cp,
-            pipeline_parallel_degree=parallel_dims.pp,
-            expert_parallel_degree=parallel_dims.ep,
-        ),
+        parallelism=parallelism,
         compile_config=CompileConfig(enable=False),
         ac_config=None,
         dump_folder="/tmp/tt_delta_export_test",
@@ -225,13 +234,16 @@ def _test_export_names_agree(engine, rank):
 
 
 def _test_unsupported_layouts_rejected(world, rank):
-    """TP / EP / PP must be named at the export boundary, not surface later as a
-    placement error or, worse, a wrong translation."""
+    """EP / PP / HSDP-with-TP must be named at the export boundary, not surface later
+    as a placement error or, worse, a wrong translation."""
     cases = {}
     if world % 2 == 0:
-        cases["tp"] = dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=2, pp=1, ep=1)
         cases["pp"] = dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=1, pp=2, ep=1)
         cases["ep"] = dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, pp=1, ep=2)
+    if world % 4 == 0:
+        # replicas plus two cut dims: the gather group would span the whole mesh and
+        # count each replica again
+        cases["hsdp+tp"] = dict(dp_shard=world // 4, dp_replicate=2, cp=1, tp=2, pp=1, ep=1)
     ok = True
     for tag, dims in cases.items():
         engine = _ExportOnlyEngine(None, None, ParallelDims(world_size=world, **dims))
@@ -252,12 +264,18 @@ def _layouts(world):
     HSDP earns its place: the replicate dim makes several ranks hold the same shard,
     and every one of them contributing would double-count. CP earns its place
     because the claim that it needs no special handling rests on torchtitan folding
-    it into the ``fsdp`` mesh dim -- worth checking rather than asserting.
+    it into the ``fsdp`` mesh dim -- worth checking rather than asserting. TP earns
+    its place because it is the only layout where two mesh dims cut the SAME tensor
+    dim: torchtitan's column-parallel weights come back as _StridedShard, whose
+    block is placed by a right-to-left rank order, while its row-parallel ones cut a
+    second dim and its norms stay replicated -- three different geometries in one
+    model, and the export has to read all three off the same placements.
     """
-    out = [("fsdp", dict(dp_shard=world, dp_replicate=1, cp=1))]
+    out = [("fsdp", dict(dp_shard=world, dp_replicate=1, cp=1, tp=1))]
     if world % 2 == 0:
-        out.append(("hsdp", dict(dp_shard=world // 2, dp_replicate=2, cp=1)))
-        out.append(("fsdp+cp", dict(dp_shard=world // 2, dp_replicate=1, cp=2)))
+        out.append(("hsdp", dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1)))
+        out.append(("fsdp+cp", dict(dp_shard=world // 2, dp_replicate=1, cp=2, tp=1)))
+        out.append(("fsdp+tp", dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=2)))
     return out
 
 
@@ -268,7 +286,7 @@ def main():
     all_ok = True
 
     for tag, dims in _layouts(world):
-        parallel_dims = ParallelDims(tp=1, pp=1, ep=1, world_size=world, **dims)
+        parallel_dims = ParallelDims(pp=1, ep=1, world_size=world, **dims)
         parallel_dims.build_mesh()
         module, adapter = _build_sharded_model(parallel_dims)
         engine = _ExportOnlyEngine(module, adapter, parallel_dims)

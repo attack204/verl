@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from verl.checkpoint_engine.delta_sync.sparse_gather import (
     gather_slot_entries_to_rank0,
@@ -73,7 +74,7 @@ def _run_case(shape, placements, mesh, dev, rank, si):
     idx_ok = torch.equal(sh_idx[so], b_idx[bo])
     val_ok = torch.equal(sh_val[so].view(torch.int16), b_val[bo].view(torch.int16))
     ok = idx_ok and val_ok and (sh_idx.numel() == b_idx.numel())
-    tag = "x".join(p.__class__.__name__[0] for p in placements)
+    tag = "x".join("Strided" if type(p).__name__ == "_StridedShard" else type(p).__name__[0] for p in placements)
     print(
         f"[shape={shape} mesh={tuple(mesh.shape)} {tag}] nnz sharded={sh_idx.numel()} "
         f"full={b_idx.numel()} idx={idx_ok} val={val_ok} -> {'PASS' if ok else 'FAIL'}"
@@ -99,6 +100,21 @@ def main():
         mesh2d = init_device_mesh("cuda", (world // 2, 2), mesh_dim_names=("fsdp", "sp"))
         for si, shape in enumerate([(4096, 1024), (7, 3), (128,)]):
             all_ok = _run_case(shape, [Shard(0), Replicate()], mesh2d, dev, rank, 50 + si) and all_ok
+
+    # 2D FSDP x TP mesh. A column-parallel weight has TP and FSDP2 cutting the SAME
+    # tensor dim, which torch expresses as _StridedShard: the cut is right-to-left,
+    # so it permutes WHICH block a rank owns rather than interleaving the block, and
+    # the shard stays one contiguous range. A row-parallel weight cuts a different
+    # dim and is a plain second Shard. Both need every rank in the gather, unlike the
+    # sp case above where only coordinate 0 contributes -- an unnoticed _StridedShard
+    # (it stopped subclassing Shard in torch 2.13) silently shrinks that group.
+    if world % 4 == 0:
+        meshtp = init_device_mesh("cuda", (world // 2, 2), mesh_dim_names=("fsdp", "tp"))
+        for si, shape in enumerate([(4096, 1024), (2048, 128), (32, 6)]):
+            pl = [_StridedShard(0, split_factor=2), Shard(0)]
+            all_ok = _run_case(shape, pl, meshtp, dev, rank, 100 + si) and all_ok
+        for si, shape in enumerate([(4096, 1024), (32, 6)]):
+            all_ok = _run_case(shape, [Shard(0), Shard(1)], meshtp, dev, rank, 150 + si) and all_ok
 
     if rank == 0:
         print("=" * 50)

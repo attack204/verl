@@ -535,10 +535,11 @@ class TorchTitanEngine(BaseEngine):
         The sharded export hands the DTensor placements straight to
         :func:`~verl.workers.engine.spec.derive_dtensor_placement`, which can only
         describe a local shard that is one hyper-rectangular block of the full
-        tensor. FSDP2 alone -- with or without HSDP replicate, and with CP folded
-        into the ``fsdp`` mesh dim -- always is. The layouts below are not, and each
-        needs work beyond placement math, so they are named here rather than
-        surfacing as a placement error midway through the export.
+        tensor, gathered over a group it can name. FSDP2 -- with or without HSDP
+        replicate, with CP folded into the ``fsdp`` mesh dim, and with or without
+        TP -- always is. The layouts below are not, and each needs work beyond
+        placement math, so they are named here rather than surfacing as a
+        placement error midway through the export.
         """
         pd = self.parallel_dims
         if pd.pp_enabled:
@@ -555,12 +556,17 @@ class TorchTitanEngine(BaseEngine):
                 "tensors and yields only the locally owned ones, which needs the spec's "
                 f"to_hf_chunk/hf_slots converter path (expert_parallel_size={pd.ep})"
             )
-        if pd.tp_enabled:
+        # TP itself needs nothing here: a column-parallel weight (FSDP2 cutting the
+        # dim TP already cut) is a _StridedShard, which is still one block, and a
+        # row-parallel one cuts a different dim so it is a plain second Shard.
+        # derive_dtensor_placement handles both.
+        if pd.tp_enabled and pd.dp_replicate > 1:
             raise NotImplementedError(
-                "the torchtitan sharded delta export does not support tensor parallelism yet: "
-                "FSDP2 shards the same tensor dim TP already cut, which it expresses as a "
-                "_StridedShard placement that derive_dtensor_placement still rejects "
-                f"(tensor_parallel_size={pd.tp})"
+                "the torchtitan sharded delta export does not support HSDP replicate together "
+                "with tensor parallelism: the weights are then sharded on two mesh dims and "
+                "replicated on a third, and derive_dtensor_placement's gather group spans the "
+                "whole mesh, which would double-count the replicas "
+                f"(data_parallel_replicate_size={pd.dp_replicate}, tensor_parallel_size={pd.tp})"
             )
 
     def get_per_tensor_param_shard(self, **kwargs):
