@@ -58,7 +58,6 @@ from verl.workers.engine.torchtitan.utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
-    iter_per_tensor_params_ep,
 )
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -529,6 +528,32 @@ class TorchTitanEngine(BaseEngine):
             params["lm_head.weight"] = params["model.embed_tokens.weight"]
         return params
 
+    def _expert_stack_slots(self, name: str, param: Any) -> Optional[list[tuple[str, tuple]]]:
+        """If ``name`` is a fused expert stack, enumerate the HF tensors it holds.
+
+        The discriminator is structural rather than a name pattern: the adapter's
+        map sends this one torchtitan key to an HF template with a SECOND ``{}``
+        (the expert id), which is exactly what "one weight here becomes many
+        weights there" looks like. Returns ``None`` for ordinary params.
+
+        The enumeration covers ALL experts, not the locally owned ones. That is
+        the whole point -- ``to_hf`` names only the local experts, so a rank that
+        trusted it would disagree with its neighbours about which HF tensors even
+        exist. Every rank can name all of them because the count is just the
+        stack's dim 0, which is a shape, identical everywhere.
+        """
+        sd_adapter = self.checkpointer.sd_adapter
+        from_hf_map = getattr(sd_adapter, "from_hf_map", None) if sd_adapter is not None else None
+        if not from_hf_map or param.ndim < 2:
+            return None
+        abstract = re.sub(r"(\d+)", "{}", name, count=1)
+        hf_template = next((hf for hf, titan in from_hf_map.items() if titan == abstract), None)
+        if hf_template is None or hf_template.count("{}") != 2:
+            return None
+        layer_id = re.search(r"\d+", name).group(0)
+        slot_shape = tuple(int(d) for d in param.shape[1:])
+        return [(hf_template.format(layer_id, e), slot_shape) for e in range(int(param.shape[0]))]
+
     def _assert_shard_export_supported(self) -> None:
         """Reject the parallelism layouts whose local shard is not one block.
 
@@ -614,32 +639,47 @@ class TorchTitanEngine(BaseEngine):
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
 
-        params = self._to_hf_named_params(params)
+        # A fused expert stack has to be made whole BEFORE it is split into one HF
+        # weight per expert. sd_adapter.to_hf() does it the other way round and
+        # keeps only the locally owned experts, so on a mesh where the expert dim
+        # is cut by more than one dim it silently drops the rest: gathering the
+        # split pieces over the ``ep`` group alone recovers ep/(efsdp*ep) of them,
+        # e.g. 32 of 64 experts at ep=4 efsdp=2. Letting the stack's own DTensor
+        # gather itself is both simpler and placement-agnostic -- EP, EFSDP and any
+        # replicate dim beside them are already encoded in its placements. The slot
+        # table is the one the sharded export uses, which is what keeps the two
+        # exports naming an identical set of HF tensors.
+        stacks = {}
+        for name, param in params.items():
+            slots = self._expert_stack_slots(name, param)
+            if slots is not None:
+                stacks[name] = slots
+        expert_stacks = [(params[name], slots) for name, slots in stacks.items()]
+        dense = self._to_hf_named_params({k: v for k, v in params.items() if k not in stacks})
+        params.clear()
 
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
 
-        # When Expert Parallel (EP) is used, sd_adapter.to_hf() only produces
-        # individual expert weights for the locally-owned experts (e.g., 16 out of
-        # 128 with EP=8). vLLM needs ALL experts. We gather the missing experts
-        # by all-gathering each expert weight across the EP process group.
-        if self.parallel_dims.ep_enabled:
-            ep_mesh = self.parallel_dims.get_optional_mesh("ep")
-            ep_group = ep_mesh.get_group()
-            ep_size = self.parallel_dims.ep
-            per_tensor_param = iter_per_tensor_params_ep(params, device, ep_group, ep_size)
-        else:
+        def _gen():
             # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
-            per_tensor_param = (
-                (
-                    name,
-                    param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
-                    if isinstance(param, DTensor)
-                    else param,
-                )
-                for name, param in params.items()
-            )
+            for name, param in dense.items():
+                if isinstance(param, DTensor):
+                    yield name, param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                else:
+                    yield name, param
+            # One stack at a time: the gathered (num_experts, ...) tensor is the
+            # peak allocation here, and holding several at once would multiply it.
+            for stack, slots in expert_stacks:
+                full = stack.to(device, non_blocking=True)
+                if isinstance(full, DTensor):
+                    full = full.full_tensor()
+                full = full.to(torch.bfloat16, non_blocking=True)
+                for e, (hf_name, _shape) in enumerate(slots):
+                    yield hf_name, full[e].clone()
+                del full
+
         # TODO: support Torchtitan PEFT
-        return per_tensor_param, None
+        return _gen(), None
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
