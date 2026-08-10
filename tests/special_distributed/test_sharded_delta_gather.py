@@ -116,6 +116,16 @@ def main():
         for si, shape in enumerate([(4096, 1024), (32, 6)]):
             all_ok = _run_case(shape, [Shard(0), Shard(1)], meshtp, dev, rank, 150 + si) and all_ok
 
+    # 2D EFSDP x EP mesh: a routed expert stack is 3-D and both dims cut the expert
+    # dim, so it is the same _StridedShard geometry as column-parallel TP on a rank
+    # higher tensor. Rank order is the only thing that differs, but the offset math
+    # runs over the local shape, and a 3-D shape is the case it has never seen.
+    if world % 4 == 0:
+        meshep = init_device_mesh("cuda", (world // 4, 4), mesh_dim_names=("efsdp", "ep"))
+        for si, shape in enumerate([(64, 768, 256), (64, 256, 768), (8, 3, 5)]):
+            pl = [_StridedShard(0, split_factor=4), Shard(0)]
+            all_ok = _run_case(shape, pl, meshep, dev, rank, 200 + si) and all_ok
+
     if rank == 0:
         print("=" * 50)
         print(f"OVERALL: {'ALL PASS ✅' if all_ok else 'FAIL ❌'}")

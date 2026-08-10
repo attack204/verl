@@ -88,6 +88,10 @@ class ShardSpec:
     # ``to_hf_chunk``) the engine can convert on the SENDER side: every rank
     # converts only its own touched dim-0 rows and ships final HF-coordinate
     # entries keyed by slot index -- rank 0 does no conversion at all.
+    # WITHOUT ``to_hf_chunk`` the split is the identity: one slot per dim-0 row,
+    # slot ``e`` is exactly ``full[e]`` with values untouched (torchtitan's fused
+    # expert stack -> one HF weight per expert). That case needs no converter and
+    # no probe, so ``_hf_entry_row_slots`` handles it with plain index math.
     hf_slots: Optional[list[tuple[str, tuple]]] = None
 
     @classmethod

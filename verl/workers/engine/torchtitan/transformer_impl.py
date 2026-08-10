@@ -554,6 +554,15 @@ class TorchTitanEngine(BaseEngine):
         slot_shape = tuple(int(d) for d in param.shape[1:])
         return [(hf_template.format(layer_id, e), slot_shape) for e in range(int(param.shape[0]))]
 
+    def _hf_delta_entry(self, name, spec, place, lidx, lval):
+        """Route the fused expert stacks to the dim-0 slot builder; everything
+        else is an identity param whose weight name is already its HF name."""
+        if spec.hf_slots is not None:
+            from ..utils import _hf_entry_row_slots
+
+            return _hf_entry_row_slots(name, spec, place, lidx, lval)
+        return super()._hf_delta_entry(name, spec, place, lidx, lval)
+
     def _assert_shard_export_supported(self) -> None:
         """Reject the parallelism layouts whose local shard is not one block.
 
@@ -562,8 +571,8 @@ class TorchTitanEngine(BaseEngine):
         describe a local shard that is one hyper-rectangular block of the full
         tensor, gathered over a group it can name. FSDP2 -- with or without HSDP
         replicate, with CP folded into the ``fsdp`` mesh dim, and with or without
-        TP -- always is. The layouts below are not, and each needs work beyond
-        placement math, so they are named here rather than surfacing as a
+        TP or EP -- always is. The layouts below are not, and each needs work
+        beyond placement math, so they are named here rather than surfacing as a
         placement error midway through the export.
         """
         pd = self.parallel_dims
@@ -574,24 +583,23 @@ class TorchTitanEngine(BaseEngine):
                 "identical across ranks the way the delta engine's lockstep gather requires "
                 f"(pipeline_parallel_size={pd.pp})"
             )
-        if pd.ep_enabled:
-            raise NotImplementedError(
-                "the torchtitan sharded delta export does not support expert parallelism: "
-                "sd_adapter.to_hf() splits the grouped expert stack into per-expert HF "
-                "tensors and yields only the locally owned ones, which needs the spec's "
-                f"to_hf_chunk/hf_slots converter path (expert_parallel_size={pd.ep})"
-            )
         # TP itself needs nothing here: a column-parallel weight (FSDP2 cutting the
         # dim TP already cut) is a _StridedShard, which is still one block, and a
         # row-parallel one cuts a different dim so it is a plain second Shard.
-        # derive_dtensor_placement handles both.
-        if pd.tp_enabled and pd.dp_replicate > 1:
+        # EP is the same shape of fact one dim over: it cuts the expert dim and
+        # EFSDP cuts it again, so a routed expert weight is another
+        # _StridedShard(0)Shard(0) block. What EP does need is the slot table --
+        # to_hf names only the local experts -- and get_per_tensor_param_shard
+        # ships the fused stack with one instead.
+        # derive_dtensor_placement handles all of these.
+        if (pd.tp_enabled or pd.ep_enabled) and pd.dp_replicate > 1:
             raise NotImplementedError(
                 "the torchtitan sharded delta export does not support HSDP replicate together "
-                "with tensor parallelism: the weights are then sharded on two mesh dims and "
-                "replicated on a third, and derive_dtensor_placement's gather group spans the "
+                "with tensor or expert parallelism: the weights are then sharded on two mesh dims "
+                "and replicated on a third, and derive_dtensor_placement's gather group spans the "
                 "whole mesh, which would double-count the replicas "
-                f"(data_parallel_replicate_size={pd.dp_replicate}, tensor_parallel_size={pd.tp})"
+                f"(data_parallel_replicate_size={pd.dp_replicate}, tensor_parallel_size={pd.tp}, "
+                f"expert_parallel_size={pd.ep})"
             )
 
     def get_per_tensor_param_shard(self, **kwargs):
@@ -605,24 +613,44 @@ class TorchTitanEngine(BaseEngine):
         offload policy from having to page the whole model in.
         """
         self._assert_shard_export_supported()
-        params = {}
+        raw = {}
         for module in self.module:
-            params.update(module.state_dict())
-        params = self._to_hf_named_params(params)
+            raw.update(module.state_dict())
+
+        # A fused expert stack is exported WHOLE, carrying a slot table that names
+        # every expert's HF tensor. Running it through to_hf instead would yield
+        # the locally owned experts only -- a different name set on each EP rank,
+        # which is precisely what the gather's lockstep cannot survive. Ordinary
+        # params still go through to_hf so their naming stays byte-identical to
+        # the full export's.
+        stacks = {}
+        for name, param in raw.items():
+            slots = self._expert_stack_slots(name, param)
+            if slots is not None:
+                stacks[name] = slots
+        params = self._to_hf_named_params({k: v for k, v in raw.items() if k not in stacks})
         device = get_device_id()  # local shards live on CPU under an offload policy
 
         from ..spec import ShardSpec
 
+        def _shard(param):
+            p = param.to(device, non_blocking=True)
+            # The wire (and the rollout side) speak bf16; mixed precision keeps
+            # fp32 master weights, so cast before the diff sees them.
+            if p.is_floating_point():
+                p = p.to(torch.bfloat16, non_blocking=True)
+            local = p.to_local() if isinstance(p, DTensor) else p
+            return local.reshape(-1)
+
         def _gen():
             for name, param in params.items():
-                spec = ShardSpec.from_param(param)
-                p = param.to(device, non_blocking=True)
-                # The wire (and the rollout side) speak bf16; mixed precision keeps
-                # fp32 master weights, so cast before the diff sees them.
-                if p.is_floating_point():
-                    p = p.to(torch.bfloat16, non_blocking=True)
-                local = p.to_local() if isinstance(p, DTensor) else p
-                yield name, local.reshape(-1), spec
+                yield name, _shard(param), ShardSpec.from_param(param)
+            # Keyed by the torchtitan name: these entries are the stack, not any
+            # one HF tensor, and the snapshot dict this feeds is per exported shard.
+            for name, slots in stacks.items():
+                spec = ShardSpec.from_param(raw[name])
+                spec.hf_slots = slots
+                yield name, _shard(raw[name]), spec
 
         return _gen(), None
 

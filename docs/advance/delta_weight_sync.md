@@ -135,10 +135,16 @@ FSDP versions and TorchTitan provide:
   Tensor parallelism works too: a column-parallel weight has FSDP2 cutting the dim TP already cut,
   which torch spells ``_StridedShard`` — still one block per rank, since the strided form permutes
   which block a rank owns rather than interleaving it — and a row-parallel weight cuts a second dim
-  and is a plain second ``Shard``. Expert and pipeline parallelism are rejected at the export
-  boundary, as is HSDP replicate combined with TP: EP needs the per-expert converter path, PP gives
-  each stage a disjoint slice of the model, and HSDP-with-TP puts replicas alongside two cut dims,
-  which the whole-mesh gather group would count twice.
+  and is a plain second ``Shard``. Expert parallelism works as well. Its geometry is the same
+  same-dim double cut one dim over (EP cuts the expert dim of a routed expert stack, EFSDP cuts it
+  again), but its naming is not: the adapter turns one fused ``(num_experts, ...)`` stack into one
+  HF weight per expert and keeps only the locally owned ones, so ranks would disagree about which
+  HF tensors exist. The export therefore ships the stack whole with a slot table naming every
+  expert, and since the split is a plain dim-0 slice, a position's expert is one divmod away — no
+  per-expert conversion. Pipeline parallelism is rejected at the export boundary, as is HSDP
+  replicate combined with TP or EP: PP gives each stage a disjoint slice of the model, and
+  HSDP-with-TP/EP puts replicas alongside two cut dims, which the whole-mesh gather group would
+  count twice.
 
 Other shard dimensions than ``Shard(0)`` are not supported and raise.
 

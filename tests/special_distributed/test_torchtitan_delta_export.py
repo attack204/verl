@@ -35,6 +35,7 @@ from verl.checkpoint_engine.delta_sync.sparse_gather import gather_slot_entries_
 from verl.workers.engine.torchtitan.transformer_impl import TorchTitanEngine
 
 FLAVOR = "debugmodel"
+MOE_FLAVOR = "debugmodel_moe"
 
 
 class _ExportOnlyEngine(TorchTitanEngine):
@@ -52,9 +53,9 @@ class _ExportOnlyEngine(TorchTitanEngine):
         self._is_offload_param = False
 
 
-def _build_sharded_model(parallel_dims):
+def _build_sharded_model(parallel_dims, flavor=None):
     """Build a torchtitan Qwen3 and parallelize it the way torchtitan itself does."""
-    spec = tt_qwen3.model_registry(FLAVOR)
+    spec = tt_qwen3.model_registry(flavor or FLAVOR)
     parallelism = ParallelismConfig(
         data_parallel_shard_degree=parallel_dims.dp_shard,
         data_parallel_replicate_degree=parallel_dims.dp_replicate,
@@ -218,14 +219,29 @@ def _test_delta_matches_full(engine, model, shard_coord, rank, tag, step_fn, ste
     return ok
 
 
+def _shard_export_slot_names(engine):
+    """The HF tensors the sharded export accounts for.
+
+    Usually one per entry, the entry's own name. A fused expert stack is the
+    exception: it is exported whole under its torchtitan name and its slot table
+    names the per-expert HF tensors it carries, so the stack contributes E names
+    and none of them is the entry's."""
+    names = []
+    for name, _local, spec in engine.get_per_tensor_param_shard()[0]:
+        names.extend([n for n, _shape in spec.hf_slots] if spec.hf_slots else [name])
+    return names
+
+
 def _test_export_names_agree(engine, rank):
-    """The full and the sharded export must enumerate the same HF tensors: the delta
-    path pairs them by name, so a mismatch means a weight the rollout never updates."""
+    """The full and the sharded export must account for the same HF tensors: the
+    delta path pairs them by name, so a mismatch means a weight the rollout never
+    updates. Compared as sets -- the sharded export groups the expert stacks at the
+    end of its stream, and nothing downstream reads the two in step."""
     full_names = [name for name, _ in engine.get_per_tensor_param()[0]]
-    shard_names = [name for name, _, _ in engine.get_per_tensor_param_shard()[0]]
-    ok = full_names == shard_names
+    shard_names = _shard_export_slot_names(engine)
+    ok = sorted(full_names) == sorted(shard_names) and len(set(shard_names)) == len(shard_names)
     if rank == 0:
-        print(f"[names] full={len(full_names)} sharded={len(shard_names)} identical_order={ok}")
+        print(f"[names] full={len(full_names)} sharded_slots={len(shard_names)} same_set={ok}")
         if not ok:
             print("  only in full   :", sorted(set(full_names) - set(shard_names))[:5])
             print("  only in sharded:", sorted(set(shard_names) - set(full_names))[:5])
@@ -234,16 +250,16 @@ def _test_export_names_agree(engine, rank):
 
 
 def _test_unsupported_layouts_rejected(world, rank):
-    """EP / PP / HSDP-with-TP must be named at the export boundary, not surface later
-    as a placement error or, worse, a wrong translation."""
+    """PP / HSDP-with-TP / HSDP-with-EP must be named at the export boundary, not
+    surface later as a placement error or, worse, a wrong translation."""
     cases = {}
     if world % 2 == 0:
         cases["pp"] = dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=1, pp=2, ep=1)
-        cases["ep"] = dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, pp=1, ep=2)
     if world % 4 == 0:
         # replicas plus two cut dims: the gather group would span the whole mesh and
         # count each replica again
         cases["hsdp+tp"] = dict(dp_shard=world // 4, dp_replicate=2, cp=1, tp=2, pp=1, ep=1)
+        cases["hsdp+ep"] = dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1, pp=1, ep=2)
     ok = True
     for tag, dims in cases.items():
         engine = _ExportOnlyEngine(None, None, ParallelDims(world_size=world, **dims))
@@ -259,7 +275,7 @@ def _test_unsupported_layouts_rejected(world, rank):
 
 
 def _layouts(world):
-    """The layouts the sharded export claims to support, as (tag, ParallelDims kwargs).
+    """The layouts the sharded export claims to support, as (tag, flavor, kwargs).
 
     HSDP earns its place: the replicate dim makes several ranks hold the same shard,
     and every one of them contributing would double-count. CP earns its place
@@ -270,12 +286,25 @@ def _layouts(world):
     block is placed by a right-to-left rank order, while its row-parallel ones cut a
     second dim and its norms stay replicated -- three different geometries in one
     model, and the export has to read all three off the same placements.
+
+    EP needs the MoE flavor and needs to be run at more than one degree. The
+    geometry is the same same-dim double cut as column-parallel TP, one dim over
+    (EP cuts the expert dim, EFSDP cuts it again), but the naming is not: the
+    stack is one exported entry standing for E HF tensors, and how the experts
+    divide between the two mesh dims changes with the degree. ep=1 is in the list
+    on purpose -- it is the degenerate geometry, and the slot table has to be
+    right there too, since a MoE model trained without EP still fuses its experts.
     """
-    out = [("fsdp", dict(dp_shard=world, dp_replicate=1, cp=1, tp=1))]
+    out = [("fsdp", FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=1))]
     if world % 2 == 0:
-        out.append(("hsdp", dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1)))
-        out.append(("fsdp+cp", dict(dp_shard=world // 2, dp_replicate=1, cp=2, tp=1)))
-        out.append(("fsdp+tp", dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=2)))
+        out.append(("hsdp", FLAVOR, dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1, ep=1)))
+        out.append(("fsdp+cp", FLAVOR, dict(dp_shard=world // 2, dp_replicate=1, cp=2, tp=1, ep=1)))
+        out.append(("fsdp+tp", FLAVOR, dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=2, ep=1)))
+        out.append(("moe+ep1", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=1)))
+        out.append(("moe+ep2", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=2)))
+        out.append(("moe+ep_full", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=world)))
+    if world % 4 == 0:
+        out.append(("moe+ep4", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=4)))
     return out
 
 
@@ -285,10 +314,10 @@ def main():
     torch.cuda.set_device(rank)
     all_ok = True
 
-    for tag, dims in _layouts(world):
-        parallel_dims = ParallelDims(pp=1, ep=1, world_size=world, **dims)
+    for tag, flavor, dims in _layouts(world):
+        parallel_dims = ParallelDims(pp=1, world_size=world, **dims)
         parallel_dims.build_mesh()
-        module, adapter = _build_sharded_model(parallel_dims)
+        module, adapter = _build_sharded_model(parallel_dims, flavor)
         engine = _ExportOnlyEngine(module, adapter, parallel_dims)
         # replicas of one shard must perturb identically, so seed by shard coordinate
         shard_coord = parallel_dims.get_mesh(["fsdp"]).get_local_rank()
