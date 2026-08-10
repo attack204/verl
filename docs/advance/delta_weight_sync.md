@@ -172,6 +172,25 @@ materialization that grows linearly with parameter bytes, so the advantage widen
 and with MoE sparsity. The per-step changed ratio is ~1-3% of parameter bytes for dense models
 (0.02-0.05% for the 235B MoE early steps) and stays there over long runs.
 
+The TorchTitan engine was measured separately -- A100/A800 80GB, ``one_step_off_policy``
+(disaggregated), offload off -- so these are not directly comparable to the table above:
+
+| model (trainer placement) | ``delta_sharded`` | ``nccl`` (full broadcast) | speedup |
+|---|---|---|---|
+| Qwen3-8B (2+2 nodes, FSDP2 `dp_shard=16`) | **3.34 s** | 34.26 s | **10.3x** |
+| Qwen3-8B (2+2 nodes, FSDP2 `dp_shard=8` x TP2) | **3.40 s** | 34.26 s | **10.1x** |
+| Qwen3-8B (1+1 nodes, 50 steps sustained) | **3.00 s** | 11.00 s | 3.7x |
+| Qwen3-30B-A3B MoE (2+2 nodes, FSDP2 x EP8, efsdp=2) | **8.07 s** | 43.43 s | **5.4x** |
+| Qwen3-0.6B (1 node, intra-node NVLink) | 0.59 s | 0.61 s | 1.0x |
+
+Trainer TP costs the sync nothing measurable (3.40 s against 3.34 s): TP changes which rank
+holds which slice, not how many elements changed, and both runs agree to three digits on
+``changed_ratio``. The MoE row's 0.866% changed ratio sits within a hair of the 8B's 0.884%,
+so grouping experts into one fused stack does not make their weights change any differently
+than a dense layer's; its smaller speedup is the payload growing with parameter count
+(1513 MB against 415 MB) while the broadcast stays near flat. The 0.6B row marks the low end
+honestly -- a 1.2 GB broadcast over NVLink is already cheap, so there is no speedup to have.
+
 Correctness evidence (details in the PR):
 
 - **200-step GRPO equivalence at 7B** (delta vs nccl, 400 syncs): reward trajectories track
