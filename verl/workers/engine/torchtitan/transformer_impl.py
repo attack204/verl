@@ -63,6 +63,50 @@ from verl.workers.engine.torchtitan.utils import (
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
 
+
+def _hf_entry_row_slots(name, spec, place, lidx, lval):
+    """Dim-0 identity slot profile: the logical tensor's dim 0 enumerates HF
+    tensors and the split copies values verbatim, so slot ``e`` IS ``full[e]``
+    and a full-tensor position's slot is one divmod away. A fused expert stack
+    ``(num_experts, *, *)`` is the case this exists for: torchtitan's adapter
+    splits it into one HF weight per expert with no reshape and no transpose.
+
+    Why not veomni's ``to_hf_chunk`` probe path: that one re-runs the backend's
+    converter on every touched dim-0 row because the conversion is an opaque
+    callable. Here it is known to be a slice, so the whole entry is a handful of
+    vectorized ops -- which matters, since a 128-expert model has one such row
+    per (layer, w1/w2/w3) and the probe path would be ~128 conversions each.
+
+    Relies on ``translate_flat_indices`` being monotonic (it is: local flat order
+    walks a block in row-major, which is increasing in full-tensor row-major
+    order), so positions arrive already grouped by slot and one ``searchsorted``
+    recovers the run lengths. Were that to stop holding, elements would land in a
+    neighbouring expert, which is what the export test's byte-exact per-HF-tensor
+    comparison fails on.
+    """
+    from ..spec import translate_flat_indices
+    from ..utils import _prodshape
+
+    slots = spec.hf_slots
+    n_slots = len(slots)
+    rows = int(spec.full_shape[0])
+    assert n_slots == rows, (
+        f"{name}: dim-0 identity slots need one slot per dim-0 row, got {n_slots} slots for {rows} rows; "
+        "a converter that emits several HF tensors per row belongs on the to_hf_chunk path"
+    )
+    dtype_str = str(lval.dtype).replace("torch.", "")
+    if lidx.numel() == 0:
+        return slots, dtype_str, torch.zeros(n_slots, dtype=torch.int64), lidx.to(torch.int32), lval
+
+    row_numel = max(_prodshape(spec.full_shape[1:]), 1)
+    gidx = translate_flat_indices(lidx, place)
+    edges = torch.arange(n_slots + 1, device=gidx.device, dtype=gidx.dtype) * row_numel
+    # One D2H for the run lengths. The diff's nonzero already synced this stream,
+    # and counts have to reach the host inside the gather anyway.
+    counts = torch.searchsorted(gidx, edges).diff().cpu()
+    return slots, dtype_str, counts, (gidx % row_numel).to(torch.int32), lval
+
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -555,13 +599,39 @@ class TorchTitanEngine(BaseEngine):
         return [(hf_template.format(layer_id, e), slot_shape) for e in range(int(param.shape[0]))]
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
-        """Route the fused expert stacks to the dim-0 slot builder; everything
-        else is an identity param whose weight name is already its HF name."""
-        if spec.hf_slots is not None:
-            from ..utils import _hf_entry_row_slots
+        """Build one parameter's final HF-coordinate delta entry.
 
+        Two shapes of parameter reach here. A fused expert stack carries
+        ``hf_slots`` and stands for one HF tensor per dim-0 row. Everything else
+        is an identity param: ``_to_hf_named_params`` already gave it its HF name
+        and the adapter left its values alone, so shard-local coordinates
+        translate straight through.
+        """
+        from ..utils import _hf_entry_identity
+
+        if spec.hf_slots is not None:
             return _hf_entry_row_slots(name, spec, place, lidx, lval)
-        return super()._hf_delta_entry(name, spec, place, lidx, lval)
+        assert spec.to_hf_chunk is None, (
+            f"{name}: the torchtitan engine has no opaque to-HF converters; "
+            "a spec carrying one did not come from this engine"
+        )
+        return _hf_entry_identity(name, spec, place, lidx, lval)
+
+    def get_per_tensor_param_delta_shard(self, **kwargs):
+        """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
+        ``(slots, dtype_str, counts, hf_idx, hf_val, gather_group)`` per parameter.
+
+        Weight->HF naming, to-HF conversion, diff and snapshot are all backend
+        business: the DTensor-generic pipeline lives in
+        :mod:`verl.workers.engine.utils`, the per-param entry builder is the
+        :meth:`_hf_delta_entry` hook. Requires a prior
+        :meth:`prime_delta_snapshots` call.
+        """
+        from ..utils import hf_delta_export
+
+        self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
+        gen, _ = self.get_per_tensor_param_shard()
+        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def _assert_shard_export_supported(self) -> None:
         """Reject the parallelism layouts whose local shard is not one block.
