@@ -13,6 +13,12 @@
 # limitations under the License.
 """Validate verl.checkpoint_engine.delta_sync.sparse_gather against the full-gather diff.
 
+This is the placement math one level below the engine tests: the geometries the
+engines actually produce, driven directly rather than through a model. 1-D FSDP,
+FSDP x SP where the replicate dim means only coordinate 0 may contribute, FSDP x TP
+in both its column-parallel (_StridedShard) and row-parallel spellings, and the 3-D
+expert stacks EFSDP x EP produces. Each case says at its call site what it is for.
+
 torchrun --nproc_per_node=4 tests/special_distributed/test_sharded_delta_gather.py
 """
 

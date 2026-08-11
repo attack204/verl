@@ -17,7 +17,19 @@ The model is a real torchtitan Qwen3, parallelized by torchtitan's own
 ``parallelize_fn`` and re-keyed by its own state dict adapter, so the DTensor
 placements and HF names under test are the ones a real run produces. The engine
 methods under test are the real ones -- only the training loop around them is
-stubbed out.
+stubbed out. Two things are asserted per layout: that the gathered sparse delta
+is byte-identical to the full export's diff, and that the two exports account
+for the same set of HF tensors -- a name in one and not the other would freeze
+a weight at its seed value without ever raising.
+
+The TP and EP layouts are load-bearing rather than decorative, and their failure
+mode is silent: read ``_StridedShard`` the naive way and every rank still
+produces the right block, the gather just collects two of them, so nothing
+raises and the values are merely wrong. Patching ``_shard_dim`` back to
+``p.is_shard()`` is the negative control -- it turns fsdp+tp red (18 parameters)
+and leaves fsdp / hsdp / fsdp+cp green, which is what says those cases test the
+strided path rather than pass alongside it. Worth rerunning that way if the
+placement math is ever refactored.
 
     torchrun --nproc_per_node=4 tests/special_distributed/test_torchtitan_delta_export.py
 """
