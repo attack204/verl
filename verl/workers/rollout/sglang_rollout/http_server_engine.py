@@ -793,12 +793,18 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         )
 
     async def load_lora_adapter_from_tensor(self, req):
+        import base64
+
+        # Same encoding as update_weights_from_tensor above: the field is
+        # `Annotated[List[bytes], Base64Bytes()]`, and JSON carries no bytes, so
+        # each per-rank payload goes over as base64 for msgspec to decode.
+        serialized_named_tensors = [base64.b64encode(t).decode("utf-8") for t in req.serialized_named_tensors]
         return await self._make_async_request(
             "load_lora_adapter_from_tensors",
             {
                 "lora_name": req.lora_name,
                 "config_dict": req.config_dict,
-                "serialized_tensors": req.serialized_tensors,
+                "serialized_named_tensors": serialized_named_tensors,
             },
         )
 
