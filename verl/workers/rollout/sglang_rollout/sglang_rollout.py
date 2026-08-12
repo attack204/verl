@@ -50,6 +50,24 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _to_ipc_device(tensor: torch.Tensor) -> torch.Tensor:
+    """Put a tensor where CUDA-IPC serialization can reach it.
+
+    SGLang ships weights over CUDA IPC, and torch's reducer only produces a
+    device slot for device tensors: the argument tuple is 15 long for CUDA and 3
+    for CPU. sglang's patch_torch rewrites a fixed index (6) in it, so a CPU
+    tensor fails as `IndexError: tuple index out of range` from inside a monkey
+    patch, naming nothing.
+
+    The LoRA path hands over CPU tensors on purpose -- `collect_lora_params()`
+    ends in `.detach().cpu()` to keep peak memory down while unsharding. That is
+    fine as a staging choice and only wrong at the wire, which is here. Moving
+    one tensor at a time keeps the saving: the whole state dict is never resident
+    on the device at once.
+    """
+    return tensor.to(torch.cuda.current_device(), non_blocking=True) if tensor.device.type == "cpu" else tensor
+
+
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -364,7 +382,7 @@ class ServerAdapter(BaseRollout):
             async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
                 await sgl_update_weights(
                     engine=self._engine,
-                    params_batch=params_batch,
+                    params_batch=[(name, _to_ipc_device(t)) for name, t in params_batch],
                     device_mesh_key="infer_tp",
                     device_mesh=self.device_mesh,
                 )
@@ -445,7 +463,7 @@ class ServerAdapter(BaseRollout):
 
         # lora weights
         processed_weights: dict[str, torch.Tensor] = {
-            name: _preprocess_tensor_for_update_weights(tensor.detach()) for name, tensor in weights
+            name: _to_ipc_device(_preprocess_tensor_for_update_weights(tensor.detach())) for name, tensor in weights
         }
 
         # Same shape as the full weight sync a hundred lines up: SGLang's two tensor-input
