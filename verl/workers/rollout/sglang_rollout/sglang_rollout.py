@@ -50,6 +50,24 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _strip_lora_base_layer(name: str) -> str:
+    """Undo the vLLM-shaped rename the engine applies to base weights.
+
+    On the adapter path the FSDP engine sends base weights through
+    ``replace_lora_wrapper()``, which *inserts* ``.base_layer`` into every
+    targeted module's key -- ``q_proj.weight`` becomes ``q_proj.base_layer.weight``.
+    Its docstring says why: that is where vLLM keeps the frozen weight of a
+    LoRA-wrapped layer. SGLang has no such level; it fuses q/k/v into ``qkv_proj``
+    and stores the weight directly, so the extra segment survives into its loader
+    and comes back as ``KeyError: 'model.layers.0.self_attn.qkv_proj.base_layer.weight'``.
+
+    The rename is rollout-specific but is applied by an engine that does not know
+    which rollout it is feeding, so undoing it here -- in the backend that
+    disagrees -- keeps the vLLM path untouched.
+    """
+    return name.replace(".base_layer.", ".") if ".base_layer." in name else name
+
+
 def _to_ipc_device(tensor: torch.Tensor) -> torch.Tensor:
     """Put a tensor where CUDA-IPC serialization can reach it.
 
@@ -382,7 +400,7 @@ class ServerAdapter(BaseRollout):
             async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
                 await sgl_update_weights(
                     engine=self._engine,
-                    params_batch=[(name, _to_ipc_device(t)) for name, t in params_batch],
+                    params_batch=[(_strip_lora_base_layer(name), _to_ipc_device(t)) for name, t in params_batch],
                     device_mesh_key="infer_tp",
                     device_mesh=self.device_mesh,
                 )
