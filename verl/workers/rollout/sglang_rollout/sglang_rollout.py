@@ -42,6 +42,7 @@ from verl.workers.rollout.sglang_rollout.http_server_engine import AsyncHttpServ
 from verl.workers.rollout.sglang_rollout.utils import (
     SGLANG_LORA_NAME,
     get_named_tensor_buckets,
+    lora_served_as_adapter,
     normalize_peft_config_for_sglang,
 )
 
@@ -187,8 +188,14 @@ class ServerAdapter(BaseRollout):
         # sleep_level controls what gets released during sleep/release:
         #   2 (default) = release weights + kv_cache (full sleep, merge path)
         #   1 = release kv_cache only (keep base weights, adapter path)
-        # Set by engine_workers.update_weights() when lora.merge=False.
-        self.sleep_level = 2
+        #
+        # Derived from config here rather than assigned after the first sync. The
+        # server's sleep() already branches on lora_served_as_adapter, which is
+        # config and therefore true from step 0; leaving this at 2 until something
+        # set it made the two disagree for exactly one iteration -- sleep released
+        # kv_cache only, resume asked for weights as well, and SGLang raised
+        # KeyError('weights') on the very first weight sync.
+        self.sleep_level = 1 if lora_served_as_adapter(self.model_config) else 2
 
     async def _init_server_adapter(self):
         if self._engine is not None:
