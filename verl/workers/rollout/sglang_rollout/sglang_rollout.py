@@ -336,7 +336,7 @@ class ServerAdapter(BaseRollout):
                 req = LoadLoRAAdapterFromTensorsReqInput(
                     lora_name=SGLANG_LORA_NAME,
                     config_dict=serialize_peft_config,
-                    serialized_tensors=serialize_named_tensors,
+                    serialized_named_tensors=serialize_named_tensors,
                 )
                 # send http request
                 await self._engine.load_lora_adapter_from_tensor(req)
@@ -441,8 +441,12 @@ class ServerAdapter(BaseRollout):
             name: _preprocess_tensor_for_update_weights(tensor.detach()) for name, tensor in weights
         }
 
-        # `LoadLoRAAdapterFromTensorsReqInput.serialized_tensors` is a single `str`: SGLang's
-        # LoRA path shards the adapter across TP ranks internally, so one payload serves all.
-        serialized_named_tensors = MultiprocessingSerializer.serialize(processed_weights, output_str=True)
+        # Same shape as the full weight sync a hundred lines up: SGLang's two tensor-input
+        # requests declare the identical field, `serialized_named_tensors: List[bytes]`,
+        # one entry per TP rank. Building it the same way here keeps the two paths in this
+        # file from drifting apart again -- they already had, which is how the LoRA path
+        # ended up passing a field name that no longer exists.
+        tp_size = self.device_mesh["infer_tp"].mesh.size()[0]
+        serialized_named_tensors = [MultiprocessingSerializer.serialize(processed_weights) for _ in range(tp_size)]
 
         return peft_config_json, serialized_named_tensors
