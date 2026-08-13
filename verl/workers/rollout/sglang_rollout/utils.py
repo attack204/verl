@@ -53,6 +53,25 @@ def normalize_peft_config_for_sglang(peft_config: dict) -> dict:
     return normalized
 
 
+def lora_rank_of(model_config) -> int:
+    """The configured LoRA rank, from whichever of the two config blocks carries it.
+
+    ``HFModelConfig`` has two blocks that are never synced: megatron runs set
+    ``model.lora.rank`` (a dict) and fsdp runs set the flat ``model.lora_rank``.
+    Reading only one of them is how the SGLang launcher came to decide LoRA was
+    enabled -- :func:`lora_served_as_adapter` checks both -- and then pass
+    ``max_lora_rank=0`` from the flat field on a megatron run, which SGLang
+    rejects with:
+
+        When no initial --lora-paths is provided, you need to specify both
+        --max-lora-rank and --lora-target-modules for LoRA initialization.
+
+    Anything that needs the rank should go through here so the two blocks cannot
+    disagree again.
+    """
+    return max(int(getattr(model_config, "lora_rank", 0) or 0), int(model_config.lora.get("rank", 0) or 0))
+
+
 def lora_served_as_adapter(model_config) -> bool:
     """Whether SGLang should serve LoRA as a hot-swappable adapter.
 
@@ -65,7 +84,7 @@ def lora_served_as_adapter(model_config) -> bool:
     loaded into SGLang: the engine must not be launched with ``enable_lora`` and requests
     must not carry a ``lora_path``.
     """
-    lora_enabled = model_config.lora_rank > 0 or model_config.lora.get("rank", 0) > 0
+    lora_enabled = lora_rank_of(model_config) > 0
     return lora_enabled and not model_config.lora.get("merge", False)
 
 

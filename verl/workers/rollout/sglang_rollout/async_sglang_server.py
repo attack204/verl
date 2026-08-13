@@ -53,6 +53,7 @@ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutpu
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import (
     SGLANG_LORA_NAME,
+    lora_rank_of,
     lora_served_as_adapter,
     sglang_lora_target_modules,
 )
@@ -330,7 +331,7 @@ class SGLangHttpServer:
             args.update(
                 {
                     "enable_lora": True,
-                    "max_lora_rank": self.model_config.lora_rank,
+                    "max_lora_rank": lora_rank_of(self.model_config),
                     "lora_target_modules": sglang_lora_target_modules(self.model_config.target_modules),
                 }
             )
