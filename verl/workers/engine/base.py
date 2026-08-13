@@ -154,7 +154,24 @@ class BaseEngine:
 
         Returns:
             Generator[tuple[str, torch.Tensor]]: A generator that yields tuples of parameter names and tensors.
-            Optional[dict]: Optional peft config.
+            Optional[dict]: ``None`` when the model carries no adapter. Otherwise a
+                PEFT config dict that MUST carry at least:
+
+                ``peft_type``, ``task_type``, ``r``, ``lora_alpha``,
+                ``target_modules``, ``lora_dropout``, ``bias``
+
+                Consumers differ in what they read -- vLLM's rollout passes the
+                dict straight into ``TensorLoRARequest`` and touches none of the
+                first two, SGLang's adapter loader needs ``peft_type`` -- so a
+                producer that omits a key breaks one backend and not the other.
+                That is how the engines came to disagree: FSDP returns
+                ``LoraConfig.to_dict()`` (all keys present) while megatron's
+                builder had no ``peft_type``.
+
+                ``peft_type`` and ``task_type`` are PEFT *enum members*, not
+                strings, because ``to_dict()`` leaves them that way and both
+                producers follow it. Anything that serializes this dict across a
+                process or HTTP boundary has to unwrap them first.
         """
         raise NotImplementedError
 
