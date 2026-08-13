@@ -17,6 +17,10 @@
 `BaseEngine.get_per_tensor_param` declares its second return value `Optional[dict]`. The
 fixtures here are built by the real producers rather than hand-written, so the tests
 break if either producer changes shape.
+
+The two producers disagree on `target_modules`: peft renders a set of concrete module
+names, megatron sends the `"all-linear"` shorthand. Both have to reach SGLang in a form
+it recognizes, which is what most of these tests pin down.
 """
 
 from __future__ import annotations
@@ -68,17 +72,29 @@ class TestNormalizePeftConfigForSGLang:
         normalize_peft_config_for_sglang(original)
         assert original == before
 
-    def test_missing_peft_type_is_rejected_not_guessed(self):
-        # The megatron producer omits peft_type entirely. That pairing is out of scope
-        # here, so it must fail with something a reader can act on rather than be
-        # silently filled in with a plausible value.
-        assert "peft_type" not in _megatron_shape()
-        with pytest.raises(ValueError, match="peft_type"):
-            normalize_peft_config_for_sglang(_megatron_shape())
+    def test_megatron_shape_is_accepted(self):
+        result = normalize_peft_config_for_sglang(_megatron_shape())
+        assert result["peft_type"] == "LORA"
+        assert result["task_type"] == "CAUSAL_LM"
+        json.dumps(result)
 
-    def test_rejection_names_the_producer_and_the_keys(self):
+    def test_all_linear_shorthand_survives_as_a_string(self):
+        # SGLang recognizes "all-linear" and expands it against the served model, but
+        # only while it is still a string. Materializing it as a list yields ten
+        # one-letter entries, which SGLang reads as module names and then rejects the
+        # adapter as incompatible with its LoRA memory pool.
+        assert _megatron_shape()["target_modules"] == "all-linear"
+        assert normalize_peft_config_for_sglang(_megatron_shape())["target_modules"] == "all-linear"
+
+    def test_missing_peft_type_is_rejected_not_guessed(self):
+        # Neither producer omits peft_type today. Should a third shape appear, it must
+        # fail with something a reader can act on rather than be silently filled in
+        # with a plausible value.
+        with pytest.raises(ValueError, match="peft_type"):
+            normalize_peft_config_for_sglang({"target_modules": ["q_proj"], "r": 8})
+
+    def test_rejection_lists_the_keys_present(self):
         with pytest.raises(ValueError) as excinfo:
-            normalize_peft_config_for_sglang(_megatron_shape())
-        message = str(excinfo.value)
-        assert "build_peft_config_for_vllm" in message
-        assert "target_modules" in message  # the key listing, to orient the reader
+            normalize_peft_config_for_sglang({"target_modules": ["q_proj"], "r": 8})
+        # The key listing is there to orient a reader who has to go find the producer.
+        assert "Keys present: r, target_modules" in str(excinfo.value)

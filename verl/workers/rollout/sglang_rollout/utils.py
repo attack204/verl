@@ -34,10 +34,15 @@ def normalize_peft_config_for_sglang(peft_config: dict) -> dict:
     and ``peft_type`` as enum members rather than the strings the wire format needs, so
     unwrap them. The input is not mutated.
 
-    The megatron engine returns a differently shaped dict: ``build_peft_config_for_vllm()``
-    carries no ``peft_type`` key at all. Rather than guess a value for a path that has not
-    been exercised, reject it with a message that says so. Nothing regresses -- that
-    combination cannot reach SGLang today either, since the caller crashes further up.
+    The megatron engine returns a differently shaped dict, from
+    ``build_peft_config_for_vllm()``. It used to carry no ``peft_type`` key at all, which
+    SGLang's loader requires; the guard below stays as a tripwire in case another engine
+    answers this contract with a third shape.
+
+    ``target_modules`` is overloaded by type, and the two engines pick different halves:
+    peft's ``to_dict()`` gives a *set* of concrete module names, which json cannot
+    serialize, while megatron sends the bare ``"all-linear"`` shorthand. Only the former
+    needs converting -- see the listify below.
     """
     normalized = dict(peft_config)
     for key in ("task_type", "peft_type"):
@@ -46,10 +51,15 @@ def normalize_peft_config_for_sglang(peft_config: dict) -> dict:
     if "peft_type" not in normalized:
         raise ValueError(
             "adapter config has no 'peft_type', which SGLang's adapter loader requires. "
-            "The megatron engine's build_peft_config_for_vllm() omits it; that pairing is "
-            "not covered by this code path. Keys present: " + ", ".join(sorted(normalized))
+            "It is produced by the training engine -- see BaseEngine.get_per_tensor_param "
+            "for the keys one has to carry. Keys present: " + ", ".join(sorted(normalized))
         )
-    normalized["target_modules"] = list(normalized["target_modules"])
+    # A bare string has to survive intact. SGLang recognizes "all-linear" and expands it
+    # against the served model, but only while it is still a string: list() would tear it
+    # into ['a','l','l','-',...], which SGLang reads as ten one-letter module names and
+    # then rejects the adapter as incompatible with its LoRA memory pool.
+    target_modules = normalized["target_modules"]
+    normalized["target_modules"] = target_modules if isinstance(target_modules, str) else list(target_modules)
     return normalized
 
 
