@@ -35,6 +35,7 @@ from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
 from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from verl.utils.device import get_device_id
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
@@ -57,9 +58,9 @@ def _strip_lora_base_layer(name: str) -> str:
 
 
 def _to_ipc_device(tensor: torch.Tensor) -> torch.Tensor:
-    """Move a CPU tensor to the device, one at a time: sglang's CUDA-IPC patch indexes a
-    reducer slot that only device tensors have."""
-    return tensor.to(torch.cuda.current_device(), non_blocking=True) if tensor.device.type == "cpu" else tensor
+    """Move a CPU tensor to the device, one at a time: sglang's IPC patch indexes a reducer slot
+    that only device tensors have."""
+    return tensor.to(get_device_id(), non_blocking=True) if tensor.device.type == "cpu" else tensor
 
 
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
