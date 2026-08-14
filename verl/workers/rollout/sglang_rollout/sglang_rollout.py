@@ -51,38 +51,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def _strip_lora_base_layer(name: str) -> str:
-    """Undo the vLLM-shaped rename the engine applies to base weights.
-
-    On the adapter path the FSDP engine sends base weights through
-    ``replace_lora_wrapper()``, which *inserts* ``.base_layer`` into every
-    targeted module's key -- ``q_proj.weight`` becomes ``q_proj.base_layer.weight``.
-    Its docstring says why: that is where vLLM keeps the frozen weight of a
-    LoRA-wrapped layer. SGLang has no such level; it fuses q/k/v into ``qkv_proj``
-    and stores the weight directly, so the extra segment survives into its loader
-    and comes back as ``KeyError: 'model.layers.0.self_attn.qkv_proj.base_layer.weight'``.
-
-    The rename is rollout-specific but is applied by an engine that does not know
-    which rollout it is feeding, so undoing it here -- in the backend that
-    disagrees -- keeps the vLLM path untouched.
-    """
+    """Drop the ``.base_layer`` segment ``replace_lora_wrapper()`` inserts for vLLM; SGLang
+    has no such level and its loader raises KeyError on it."""
     return name.replace(".base_layer.", ".") if ".base_layer." in name else name
 
 
 def _to_ipc_device(tensor: torch.Tensor) -> torch.Tensor:
-    """Put a tensor where CUDA-IPC serialization can reach it.
-
-    SGLang ships weights over CUDA IPC, and torch's reducer only produces a
-    device slot for device tensors: the argument tuple is 15 long for CUDA and 3
-    for CPU. sglang's patch_torch rewrites a fixed index (6) in it, so a CPU
-    tensor fails as `IndexError: tuple index out of range` from inside a monkey
-    patch, naming nothing.
-
-    The LoRA path hands over CPU tensors on purpose -- `collect_lora_params()`
-    ends in `.detach().cpu()` to keep peak memory down while unsharding. That is
-    fine as a staging choice and only wrong at the wire, which is here. Moving
-    one tensor at a time keeps the saving: the whole state dict is never resident
-    on the device at once.
-    """
+    """Move a CPU tensor to the device, one at a time: sglang's CUDA-IPC patch indexes a
+    reducer slot that only device tensors have."""
     return tensor.to(torch.cuda.current_device(), non_blocking=True) if tensor.device.type == "cpu" else tensor
 
 
@@ -224,13 +200,7 @@ class ServerAdapter(BaseRollout):
         # sleep_level controls what gets released during sleep/release:
         #   2 (default) = release weights + kv_cache (full sleep, merge path)
         #   1 = release kv_cache only (keep base weights, adapter path)
-        #
-        # Derived from config here rather than assigned after the first sync. The
-        # server's sleep() already branches on lora_served_as_adapter, which is
-        # config and therefore true from step 0; leaving this at 2 until something
-        # set it made the two disagree for exactly one iteration -- sleep released
-        # kv_cache only, resume asked for weights as well, and SGLang raised
-        # KeyError('weights') on the very first weight sync.
+        # From config, not assigned after the first sync: sleep() branches on the same predicate.
         self.sleep_level = 1 if lora_served_as_adapter(self.model_config) else 2
 
     async def _init_server_adapter(self):
@@ -484,11 +454,7 @@ class ServerAdapter(BaseRollout):
             name: _to_ipc_device(_preprocess_tensor_for_update_weights(tensor.detach())) for name, tensor in weights
         }
 
-        # Same shape as the full weight sync a hundred lines up: SGLang's two tensor-input
-        # requests declare the identical field, `serialized_named_tensors: List[bytes]`,
-        # one entry per TP rank. Building it the same way here keeps the two paths in this
-        # file from drifting apart again -- they already had, which is how the LoRA path
-        # ended up passing a field name that no longer exists.
+        # One serialized copy per TP rank, same field and shape as the weight sync above.
         tp_size = self.device_mesh["infer_tp"].mesh.size()[0]
         serialized_named_tensors = [MultiprocessingSerializer.serialize(processed_weights) for _ in range(tp_size)]
 

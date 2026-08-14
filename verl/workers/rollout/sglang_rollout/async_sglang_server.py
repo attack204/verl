@@ -471,10 +471,7 @@ class SGLangHttpServer:
             # In hybrid mode, rollout is wake up in `update_weights`
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            # Directly call engine to wake up without sync weights. Resume exactly
-            # what sleep() released: in adapter mode it keeps the base weights
-            # resident, and asking for a tag that was never offloaded makes
-            # SGLang's `offload_tags.remove()` raise KeyError('weights').
+            # Resume exactly what sleep() released; adapter mode keeps the base weights resident.
             tags = ["kv_cache"] if self.lora_as_adapter else ["kv_cache", "weights"]
             obj = ResumeMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.resume_memory_occupation(obj, None)

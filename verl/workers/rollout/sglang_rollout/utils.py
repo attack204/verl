@@ -27,58 +27,25 @@ SGLANG_LORA_NAME = "verl_actor_lora_name"
 
 
 def normalize_peft_config_for_sglang(peft_config: dict) -> dict:
-    """Normalize an engine's adapter config into what SGLang's adapter loader accepts.
-
-    ``BaseEngine.get_per_tensor_param`` declares this value ``Optional[dict]``, and the
-    FSDP engine honours that with ``LoraConfig.to_dict()`` -- which leaves ``task_type``
-    and ``peft_type`` as enum members rather than the strings the wire format needs, so
-    unwrap them. The input is not mutated.
-
-    The megatron engine returns a differently shaped dict, from
-    ``build_peft_config_for_vllm()``. It used to carry no ``peft_type`` key at all, which
-    SGLang's loader requires; the guard below stays as a tripwire in case another engine
-    answers this contract with a third shape.
-
-    ``target_modules`` is overloaded by type, and the two engines pick different halves:
-    peft's ``to_dict()`` gives a *set* of concrete module names, which json cannot
-    serialize, while megatron sends the bare ``"all-linear"`` shorthand. Only the former
-    needs converting -- see the listify below.
-    """
+    """Normalize an engine's adapter config (enums to strings) for SGLang's adapter loader."""
     normalized = dict(peft_config)
     for key in ("task_type", "peft_type"):
         if key in normalized:
             normalized[key] = getattr(normalized[key], "value", normalized[key])
     if "peft_type" not in normalized:
         raise ValueError(
-            "adapter config has no 'peft_type', which SGLang's adapter loader requires. "
-            "It is produced by the training engine -- see BaseEngine.get_per_tensor_param "
-            "for the keys one has to carry. Keys present: " + ", ".join(sorted(normalized))
+            "adapter config has no 'peft_type', which SGLang's adapter loader requires. See "
+            "BaseEngine.get_per_tensor_param for the keys. Keys present: " + ", ".join(sorted(normalized))
         )
-    # A bare string has to survive intact. SGLang recognizes "all-linear" and expands it
-    # against the served model, but only while it is still a string: list() would tear it
-    # into ['a','l','l','-',...], which SGLang reads as ten one-letter module names and
-    # then rejects the adapter as incompatible with its LoRA memory pool.
+    # A bare string must stay one: list() would tear "all-linear" into characters.
     target_modules = normalized["target_modules"]
     normalized["target_modules"] = target_modules if isinstance(target_modules, str) else list(target_modules)
     return normalized
 
 
 def lora_rank_of(model_config) -> int:
-    """The configured LoRA rank, from whichever of the two config blocks carries it.
-
-    ``HFModelConfig`` has two blocks that are never synced: megatron runs set
-    ``model.lora.rank`` (a dict) and fsdp runs set the flat ``model.lora_rank``.
-    Reading only one of them is how the SGLang launcher came to decide LoRA was
-    enabled -- :func:`lora_served_as_adapter` checks both -- and then pass
-    ``max_lora_rank=0`` from the flat field on a megatron run, which SGLang
-    rejects with:
-
-        When no initial --lora-paths is provided, you need to specify both
-        --max-lora-rank and --lora-target-modules for LoRA initialization.
-
-    Anything that needs the rank should go through here so the two blocks cannot
-    disagree again.
-    """
+    """The LoRA rank, from whichever block carries it: megatron sets ``model.lora.rank``, fsdp
+    the flat ``model.lora_rank``."""
     return max(int(getattr(model_config, "lora_rank", 0) or 0), int(model_config.lora.get("rank", 0) or 0))
 
 
@@ -99,33 +66,13 @@ def lora_served_as_adapter(model_config) -> bool:
 
 
 def sglang_lora_target_modules(target_modules: Any) -> list[str]:
-    """Render verl's ``model.target_modules`` as SGLang's ``lora_target_modules``.
-
-    Following PEFT, verl overloads this field by type: a list names modules matched
-    exactly or by suffix, while a bare string is either the ``"all-linear"`` shorthand
-    or a *regex* matched against the whole parameter key -- see
-    :func:`verl.utils.model.check_target_modules`, which dispatches on exactly that.
-
-    SGLang supports neither form. It normalizes the field with ``set(...)``, so a bare
-    string is torn into its characters and the LoRA memory pool later dies on one of
-    them::
-
-        NotImplementedError: get_hidden_dim not implemented for i
-
-    ``"all-linear"`` translates to SGLang's own ``"all"`` sentinel, which it expands
-    itself. A regex has no SGLang equivalent, and reading it as a literal module name
-    would silently adapt a different set of modules than training did, so it is
-    rejected with an actionable message instead.
-    """
+    """Render verl's ``model.target_modules`` as SGLang's ``lora_target_modules``."""
     if target_modules == "all-linear":
         return ["all"]
     if isinstance(target_modules, str):
         raise ValueError(
-            f"SGLang cannot serve a regex `target_modules` ({target_modules!r}). PEFT matches a "
-            f"string against the full parameter key, which SGLang's LoRA pool has no equivalent "
-            f"of, and reading it as a literal module name would adapt different modules than "
-            f"training did. Use `all-linear`, or list the module names explicitly, e.g. "
-            f"[q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]."
+            f"SGLang cannot serve a regex `target_modules` ({target_modules!r}); PEFT matches it "
+            f"against the whole parameter key. Use `all-linear`, or list the module names."
         )
     return list(target_modules)
 

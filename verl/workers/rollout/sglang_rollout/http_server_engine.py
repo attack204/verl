@@ -87,12 +87,7 @@ def _read_response(response: requests.Response):
 
 
 def _log_error_body(endpoint: str, status: int, body: str) -> None:
-    """Log a failed response's body.
-
-    `raise_for_status()` reports only the status line, but SGLang returns the actual
-    reason -- a pydantic validation report, a scheduler traceback -- in the body, so
-    without this a 400 is indistinguishable from any other 400.
-    """
+    """Log a failed response's body; `raise_for_status()` reports only the status line."""
     logger.error(f"HTTP {status} from {endpoint}: {body[:_ERROR_BODY_CHARS]}")
 
 
@@ -795,9 +790,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
     async def load_lora_adapter_from_tensor(self, req):
         import base64
 
-        # Same encoding as update_weights_from_tensor above: the field is
-        # `Annotated[List[bytes], Base64Bytes()]`, and JSON carries no bytes, so
-        # each per-rank payload goes over as base64 for msgspec to decode.
+        # Base64 like update_weights_from_tensor above: the field is List[bytes], JSON has none.
         serialized_named_tensors = [base64.b64encode(t).decode("utf-8") for t in req.serialized_named_tensors]
         return await self._make_async_request(
             "load_lora_adapter_from_tensors",

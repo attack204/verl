@@ -56,25 +56,13 @@ def print_adapter_info(model):
 
 
 def build_peft_config_for_vllm(lora_config: dict) -> dict:
-    """Build the ``peft_config`` a rollout backend receives, from megatron's LoRA config.
-
-    Despite the name this is the megatron engine's answer for *every* rollout
-    backend -- it is what ``get_per_tensor_param`` returns as its second value.
-    The name reflects vLLM being the only consumer when it was written, and vLLM
-    does not read ``peft_type``, which is why the key was missing: the FSDP engine
-    returns ``LoraConfig.to_dict()``, which has it, so the two engines answered
-    the same contract with differently shaped dicts. SGLang's adapter loader does
-    read it, and rejects a config without it.
-
-    See :meth:`verl.workers.engine.base.BaseEngine.get_per_tensor_param` for the
-    keys a returned config has to carry.
+    """Build the ``peft_config`` every rollout backend receives, from megatron's LoRA config.
 
     Args:
         lora_config: Megatron lora configuration dictionary.
 
     Returns:
-        A dict accepted by both vLLM's ``PEFTHelper.from_dict()`` and SGLang's
-        adapter loader.
+        A dict accepted by both vLLM's PEFTHelper.from_dict() and SGLang's adapter loader.
     """
     from peft import PeftType, TaskType
 
