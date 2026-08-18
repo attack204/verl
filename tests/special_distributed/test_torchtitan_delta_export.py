@@ -28,10 +28,21 @@ produces the right block, the gather just collects two of them, so nothing
 raises and the values are merely wrong. Patching ``_shard_dim`` back to
 ``p.is_shard()`` is the negative control -- it turns fsdp+tp red (18 parameters)
 and leaves fsdp / hsdp / fsdp+cp green, which is what says those cases test the
-strided path rather than pass alongside it. Worth rerunning that way if the
+strided path rather than pass alongside it.
+
+The layouts that put a replicate dim beside two cut dims come in two halves, and
+the controls separate them. Gathering over the whole mesh instead of one replica
+of it still passes -- the replicas contribute nothing either way -- so the
+per-replica group is a cost argument, and its membership is pinned by the size
+assertion in test_sharded_delta_gather rather than by any value here. Doing that
+AND letting every replica contribute turns exactly hsdp+tp (34 parameters) and
+hsdp+ep (1536) red, while plain hsdp and every layout without replicas stays
+green: with one cut dim the gather group already excludes the replicate dim, so
+the double count only becomes reachable once a second dim is cut. Both halves
+live in ``tools/negctl_hsdp_replicas.py``; worth rerunning all of these if the
 placement math is ever refactored.
 
-    torchrun --nproc_per_node=4 tests/special_distributed/test_torchtitan_delta_export.py
+    torchrun --nproc_per_node=8 tests/special_distributed/test_torchtitan_delta_export.py
 """
 
 from types import SimpleNamespace
@@ -262,16 +273,11 @@ def _test_export_names_agree(engine, rank):
 
 
 def _test_unsupported_layouts_rejected(world, rank):
-    """PP / HSDP-with-TP / HSDP-with-EP must be named at the export boundary, not
-    surface later as a placement error or, worse, a wrong translation."""
+    """PP must be named at the export boundary, not surface later as a placement
+    error or, worse, a wrong translation."""
     cases = {}
     if world % 2 == 0:
         cases["pp"] = dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=1, pp=2, ep=1)
-    if world % 4 == 0:
-        # replicas plus two cut dims: the gather group would span the whole mesh and
-        # count each replica again
-        cases["hsdp+tp"] = dict(dp_shard=world // 4, dp_replicate=2, cp=1, tp=2, pp=1, ep=1)
-        cases["hsdp+ep"] = dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1, pp=1, ep=2)
     ok = True
     for tag, dims in cases.items():
         engine = _ExportOnlyEngine(None, None, ParallelDims(world_size=world, **dims))
@@ -306,6 +312,14 @@ def _layouts(world):
     divide between the two mesh dims changes with the degree. ep=1 is in the list
     on purpose -- it is the degenerate geometry, and the slot table has to be
     right there too, since a MoE model trained without EP still fuses its experts.
+
+    HSDP x TP and HSDP x EP are the two combined layouts: a replicate dim beside
+    two cut dims. They add no new block geometry -- a replicate dim shifts no
+    offset -- so what they exercise is the gather group, which has to span the
+    two cut dims and stop there rather than spanning the mesh. Whether it does is
+    invisible in the values (the replicas contribute nothing either way), so the
+    membership is asserted directly in test_sharded_delta_gather; here the check
+    is that the export as a whole still reproduces the full one.
     """
     out = [("fsdp", FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=1))]
     if world % 2 == 0:
@@ -315,8 +329,12 @@ def _layouts(world):
         out.append(("moe+ep1", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=1)))
         out.append(("moe+ep2", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=2)))
         out.append(("moe+ep_full", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=world)))
+        # dp_shard // 2 experts' worth of EFSDP beside EP, so the stack really is
+        # cut on two dims and not just by ep
+        out.append(("hsdp+ep", MOE_FLAVOR, dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1, ep=2)))
     if world % 4 == 0:
         out.append(("moe+ep4", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=4)))
+        out.append(("hsdp+tp", FLAVOR, dict(dp_shard=world // 4, dp_replicate=2, cp=1, tp=2, ep=1)))
     return out
 
 

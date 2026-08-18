@@ -634,16 +634,16 @@ class TorchTitanEngine(BaseEngine):
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def _assert_shard_export_supported(self) -> None:
-        """Reject the parallelism layouts whose local shard is not one block.
+        """Reject the one parallelism layout whose local shard is not a block.
 
         The sharded export hands the DTensor placements straight to
         :func:`~verl.workers.engine.spec.derive_dtensor_placement`, which can only
         describe a local shard that is one hyper-rectangular block of the full
         tensor, gathered over a group it can name. FSDP2 -- with or without HSDP
         replicate, with CP folded into the ``fsdp`` mesh dim, and with or without
-        TP or EP -- always is. The layouts below are not, and each needs work
-        beyond placement math, so they are named here rather than surfacing as a
-        placement error midway through the export.
+        TP or EP -- always is. PP is not, and fixing that needs work beyond
+        placement math, so it is named here rather than surfacing as a placement
+        error midway through the export.
         """
         pd = self.parallel_dims
         if pd.pp_enabled:
@@ -653,24 +653,17 @@ class TorchTitanEngine(BaseEngine):
                 "identical across ranks the way the delta engine's lockstep gather requires "
                 f"(pipeline_parallel_size={pd.pp})"
             )
-        # TP itself needs nothing here: a column-parallel weight (FSDP2 cutting the
-        # dim TP already cut) is a _StridedShard, which is still one block, and a
-        # row-parallel one cuts a different dim so it is a plain second Shard.
-        # EP is the same shape of fact one dim over: it cuts the expert dim and
-        # EFSDP cuts it again, so a routed expert weight is another
-        # _StridedShard(0)Shard(0) block. What EP does need is the slot table --
-        # to_hf names only the local experts -- and get_per_tensor_param_shard
-        # ships the fused stack with one instead.
+        # Nothing else needs naming here. TP: a column-parallel weight (FSDP2
+        # cutting the dim TP already cut) is a _StridedShard, which is still one
+        # block, and a row-parallel one cuts a different dim so it is a plain
+        # second Shard. EP is the same shape of fact one dim over -- it cuts the
+        # expert dim and EFSDP cuts it again, so a routed expert weight is another
+        # _StridedShard(0)Shard(0) block. What EP does need is the slot table
+        # (to_hf names only the local experts), which get_per_tensor_param_shard
+        # ships with the fused stack. HSDP replicate on top of either is just a
+        # Replicate dim beside those two Shard dims: the replicas keep lockstep
+        # with an empty delta and the gather group holds their coordinate fixed.
         # derive_dtensor_placement handles all of these.
-        if (pd.tp_enabled or pd.ep_enabled) and pd.dp_replicate > 1:
-            raise NotImplementedError(
-                "the torchtitan sharded delta export does not support HSDP replicate together "
-                "with tensor or expert parallelism: the weights are then sharded on two mesh dims "
-                "and replicated on a third, and derive_dtensor_placement's gather group spans the "
-                "whole mesh, which would double-count the replicas "
-                f"(data_parallel_replicate_size={pd.dp_replicate}, tensor_parallel_size={pd.tp}, "
-                f"expert_parallel_size={pd.ep})"
-            )
 
     def get_per_tensor_param_shard(self, **kwargs):
         """Like :meth:`get_per_tensor_param`, but yields this rank's *local* FSDP2

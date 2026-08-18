@@ -16,10 +16,16 @@
 This is the placement math one level below the engine tests: the geometries the
 engines actually produce, driven directly rather than through a model. 1-D FSDP,
 FSDP x SP where the replicate dim means only coordinate 0 may contribute, FSDP x TP
-in both its column-parallel (_StridedShard) and row-parallel spellings, and the 3-D
-expert stacks EFSDP x EP produces. Each case says at its call site what it is for.
+in both its column-parallel (_StridedShard) and row-parallel spellings, the 3-D
+expert stacks EFSDP x EP produces, and HSDP replicate beside either of those two
+cut dims. Each case says at its call site what it is for.
 
-torchrun --nproc_per_node=4 tests/special_distributed/test_sharded_delta_gather.py
+The derived gather group is used rather than the default one, which is what puts
+``derive_dtensor_placement``'s group choice under test: only rank 0's gathered
+result is kept, so a group missing a contributor drops its elements silently.
+Its size is asserted too -- one copy of every block and no replicas.
+
+torchrun --nproc_per_node=8 tests/special_distributed/test_sharded_delta_gather.py
 """
 
 import torch
@@ -50,11 +56,23 @@ def _run_case(shape, placements, mesh, dev, rank, si):
     dt_new = distribute_tensor(full_new, mesh, placements)
 
     # --- sharded path (real module) ---
-    place, contributes, _pg = derive_dtensor_placement(ShardSpec.from_param(dt_new))
+    place, contributes, pg = derive_dtensor_placement(ShardSpec.from_param(dt_new))
     loc_new = dt_new.to_local().reshape(-1)
     loc_old = dt_old.to_local().reshape(-1)
     place2, _, _ = derive_dtensor_placement(ShardSpec.from_param(dt_old))
     assert place == place2
+
+    # One copy of every block and no replicas: the product of the Shard dims'
+    # sizes, which is the whole mesh only when nothing is replicated. Spanning a
+    # replicate dim would still gather the right answer -- the replicas send
+    # nothing -- but the gather pads every rank to the largest blob, so it would
+    # charge the replicate degree for blobs that are empty by construction.
+    n_shard = 1
+    for d, p in enumerate(placements):
+        if p.is_shard() or type(p).__name__ == "_StridedShard":
+            n_shard *= mesh.size(d)
+    assert dist.get_world_size(pg) == n_shard, f"gather group has {dist.get_world_size(pg)} ranks, want {n_shard}"
+
     if contributes:
         # engine convention: diff in shard-local coordinates, then translate
         lidx, gval = shard_delta_indices(loc_new, loc_old, 0)
@@ -63,7 +81,7 @@ def _run_case(shape, placements, mesh, dev, rank, si):
         gidx = torch.empty(0, dtype=torch.int64, device=dev)
         gval = torch.empty(0, dtype=loc_new.dtype, device=dev)
     counts = torch.tensor([int(gidx.numel())], dtype=torch.int64, device=gidx.device)
-    gathered = gather_slot_entries_to_rank0(gidx, gval, counts)  # None on rank != 0
+    gathered = gather_slot_entries_to_rank0(gidx, gval, counts, group=pg)  # None off the group's rank 0
 
     # --- baseline: full gather + diff ---
     fo = dt_old.full_tensor().reshape(-1)
@@ -131,6 +149,32 @@ def main():
         for si, shape in enumerate([(64, 768, 256), (64, 256, 768), (8, 3, 5)]):
             pl = [_StridedShard(0, split_factor=4), Shard(0)]
             all_ok = _run_case(shape, pl, meshep, dev, rank, 200 + si) and all_ok
+
+    # 3D HSDP x TP and HSDP x EP: a Replicate dim beside the two cut dims above.
+    # The blocks are the same ones -- a replicate dim shifts no offset -- so what
+    # is under test is the gather group: it must span the two Shard dims and stop
+    # there, since the replicas hold copies of blocks it already has. Getting the
+    # membership wrong is the silent failure: the elements a missing contributor
+    # owned simply never arrive.
+    if world % 8 == 0:
+        meshhtp = init_device_mesh("cuda", (2, world // 4, 2), mesh_dim_names=("dp_replicate", "fsdp", "tp"))
+        for si, shape in enumerate([(4096, 1024), (32, 6)]):
+            pl = [Replicate(), _StridedShard(0, split_factor=2), Shard(0)]
+            all_ok = _run_case(shape, pl, meshhtp, dev, rank, 300 + si) and all_ok
+        for si, shape in enumerate([(4096, 1024), (32, 6)]):
+            all_ok = _run_case(shape, [Replicate(), Shard(0), Shard(1)], meshhtp, dev, rank, 350 + si) and all_ok
+
+        meshhep = init_device_mesh("cuda", (2, world // 4, 2), mesh_dim_names=("dp_replicate", "efsdp", "ep"))
+        for si, shape in enumerate([(64, 768, 256), (8, 3, 5)]):
+            pl = [Replicate(), _StridedShard(0, split_factor=2), Shard(0)]
+            all_ok = _run_case(shape, pl, meshhep, dev, rank, 400 + si) and all_ok
+
+        # replicate degree 4 leaves rank 0's group a quarter of the mesh, which is
+        # the sharpest version of "the group is not the mesh".
+        meshwide = init_device_mesh("cuda", (4, world // 8, 2), mesh_dim_names=("dp_replicate", "efsdp", "ep"))
+        for si, shape in enumerate([(64, 768, 256), (8, 3, 5)]):
+            pl = [Replicate(), _StridedShard(0, split_factor=2), Shard(0)]
+            all_ok = _run_case(shape, pl, meshwide, dev, rank, 450 + si) and all_ok
 
     if rank == 0:
         print("=" * 50)

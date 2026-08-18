@@ -141,10 +141,11 @@ FSDP versions and TorchTitan provide:
   HF weight per expert and keeps only the locally owned ones, so ranks would disagree about which
   HF tensors exist. The export therefore ships the stack whole with a slot table naming every
   expert, and since the split is a plain dim-0 slice, a position's expert is one divmod away — no
-  per-expert conversion. Pipeline parallelism is rejected at the export boundary, as is HSDP
-  replicate combined with TP or EP: PP gives each stage a disjoint slice of the model, and
-  HSDP-with-TP/EP puts replicas alongside two cut dims, which the whole-mesh gather group would
-  count twice.
+  per-expert conversion. HSDP replicate combines with either: a replicate dim beside the two cut
+  dims adds no new block geometry, and the gather group holds its coordinate fixed rather than
+  spanning it, so a replica is never asked for a block one of its peers already sent. Pipeline
+  parallelism is the one layout rejected at the export boundary, because each stage holds a disjoint
+  slice of the model and the delta engine's gather is lockstep across ranks.
 
 Other shard dimensions than ``Shard(0)`` are not supported and raise.
 

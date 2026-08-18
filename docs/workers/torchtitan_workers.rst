@@ -60,10 +60,10 @@ Enable it with ``model_engine=torchtitan``.
 - Parameter and optimizer-state offload to CPU to fit larger models.
 
 - Sharded delta weight sync (``checkpoint_engine.backend=delta_sharded``) for
-  disaggregated runs — see :doc:`../advance/delta_weight_sync`. FSDP2, optionally
-  with tensor parallelism, expert parallelism, HSDP replicate or context
-  parallelism; PP and HSDP-replicate-with-TP/EP are rejected at the export
-  boundary with a message naming which one.
+  disaggregated runs — see :doc:`../advance/delta_weight_sync`. FSDP2, in any
+  combination with tensor parallelism, expert parallelism, HSDP replicate and
+  context parallelism; PP is rejected at the export boundary with a message
+  saying why.
 
 
 **Cons**

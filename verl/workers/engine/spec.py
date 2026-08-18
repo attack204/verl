@@ -239,9 +239,12 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
       default ``Shard(0)`` yields a flat-contiguous block, which keeps the add
       fast path in :func:`translate_flat_indices`. With several Shard dims (e.g.
       automodel's EP x FSDP ``(Shard(0), Shard(1))`` expert mesh, or FSDP2 x TP
-      cutting the same dim twice) every rank holds a distinct block, the gather
-      group spans the whole mesh (created once and cached), and Replicate dims
-      are not supported alongside them.
+      cutting the same dim twice) every rank holds a distinct block and the
+      gather group spans every Shard dim at once (:func:`_shard_dims_group`).
+      Replicate dims may sit beside them -- that is HSDP combined with TP or EP
+      -- and behave exactly as they do next to a single Shard dim: the replicas
+      do not contribute, and the group holds their coordinate fixed instead of
+      spanning them.
 
     ``_StridedShard`` (FSDP2 sharding a dim TP already cut) is a block too: it
     encodes the right-to-left cut order, which permutes WHICH block a rank gets
@@ -274,35 +277,56 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
         return 0, contributes, None
 
     local_shape, global_offset = compute_local_shape_and_global_offset(spec.full_shape, spec.mesh, list(placements))
+    place = BlockPlacement(tuple(local_shape), tuple(global_offset), tuple(spec.full_shape))
 
     if len(shard_dims) == 1:
-        group = spec.mesh.get_group(mesh_dim=shard_dims[0])
-        return BlockPlacement(tuple(local_shape), tuple(global_offset), tuple(spec.full_shape)), contributes, group
-
-    # several Shard dims: every rank owns a distinct block; gather spans the whole mesh.
-    assert all(_shard_dim(p) is not None for p in placements), (
-        f"Replicate dims are not supported alongside multiple Shard dims; got placements={placements}"
-    )
-    group = _flattened_mesh_group(spec.mesh)
-    return BlockPlacement(tuple(local_shape), tuple(global_offset), tuple(spec.full_shape)), contributes, group
+        return place, contributes, spec.mesh.get_group(mesh_dim=shard_dims[0])
+    return place, contributes, _shard_dims_group(spec.mesh, shard_dims)
 
 
-_FLAT_GROUPS: dict[tuple, ProcessGroup] = {}
+_GATHER_GROUPS: dict[tuple, ProcessGroup] = {}
 
 
-def _flattened_mesh_group(mesh: DeviceMesh) -> ProcessGroup:
-    """One process group spanning every rank of ``mesh``, created once per mesh.
+def _shard_dims_group(mesh: DeviceMesh, shard_dims: list[int]) -> ProcessGroup:
+    """The group holding one copy of every block: the ranks reached by varying the
+    Shard mesh dims, with this rank's coordinate held fixed on the others.
 
-    ``dist.new_group`` must be called by all processes in the same order; every
-    trainer rank walks the export in an identical order, so the cache stays in
-    lockstep. The group's rank 0 is the mesh's smallest global rank, which keeps
-    the gathered result on the engine master whenever it is part of the mesh.
+    That is exactly what ``mesh.get_group(mesh_dim=d)`` gives for a single Shard
+    dim, generalised to several at once; when the Shard dims are the only ones,
+    it is the whole mesh.
+
+    Holding the other dims fixed is what keeps HSDP from paying for its replicas.
+    A Replicate dim beside the Shard dims already contributes nothing (see
+    ``contributes``), so a group spanning it would still gather the right answer
+    -- but ``gather_slot_entries_to_rank0`` pads every rank's blob to the largest
+    one, so the replicate degree would be charged in wire bytes and in rank 0's
+    staging buffers for blobs that are empty by construction.
+
+    Groups are cached by rank set and created on every rank, since
+    ``dist.new_group`` is collective: the combos are walked in a fixed order and
+    every trainer rank walks the export in the same order, which keeps the calls
+    -- and therefore the cache -- in lockstep. Each group's rank 0 is its
+    smallest global rank, so the gathered result lands on the engine master
+    whenever the master is one of its members.
     """
+    import itertools
+
     import torch.distributed as dist
 
-    ranks = tuple(sorted(int(r) for r in mesh.mesh.flatten().tolist()))
-    got = _FLAT_GROUPS.get(ranks)
-    if got is None:
-        got = dist.new_group(list(ranks))
-        _FLAT_GROUPS[ranks] = got
-    return got
+    coord = mesh.get_coordinate()
+    assert coord is not None, "cannot derive a gather group for a rank outside the mesh it exports from"
+    other = [d for d in range(mesh.ndim) if d not in shard_dims]
+    mine = None
+    for combo in itertools.product(*[range(mesh.size(d)) for d in other]):
+        index: list = [slice(None)] * mesh.ndim
+        for d, c in zip(other, combo, strict=True):
+            index[d] = c
+        ranks = tuple(sorted(int(r) for r in mesh.mesh[tuple(index)].flatten().tolist()))
+        got = _GATHER_GROUPS.get(ranks)
+        if got is None:
+            got = dist.new_group(list(ranks))
+            _GATHER_GROUPS[ranks] = got
+        if all(coord[d] == c for d, c in zip(other, combo, strict=True)):
+            mine = got
+    assert mine is not None, f"no gather group covers coordinate {coord} of mesh {tuple(mesh.mesh.shape)}"
+    return mine
