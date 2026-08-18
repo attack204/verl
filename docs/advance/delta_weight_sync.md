@@ -143,7 +143,11 @@ FSDP versions and TorchTitan provide:
   expert, and since the split is a plain dim-0 slice, a position's expert is one divmod away — no
   per-expert conversion. HSDP replicate combines with either: a replicate dim beside the two cut
   dims adds no new block geometry, and the gather group holds its coordinate fixed rather than
-  spanning it, so a replica is never asked for a block one of its peers already sent. Pipeline
+  spanning it, so a replica is never asked for a block one of its peers already sent. (HSDP
+  together with EP additionally needs a TorchTitan-side fix: its MoE state dict adapter reads
+  ``placement.dim`` before checking the placement type, so a replicate dim raises inside
+  ``to_hf()`` during checkpoint load, before training starts. That is independent of the delta
+  path — the export ships expert stacks whole and never calls ``to_hf()`` on them.) Pipeline
   parallelism is the one layout rejected at the export boundary, because each stage holds a disjoint
   slice of the model and the delta engine's gather is lockstep across ranks.
 
