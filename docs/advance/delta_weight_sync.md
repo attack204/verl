@@ -180,6 +180,7 @@ The TorchTitan engine was measured separately -- A100/A800 80GB, ``one_step_off_
 |---|---|---|---|
 | Qwen3-8B (2+2 nodes, FSDP2 `dp_shard=16`) | **3.34 s** | 34.26 s | **10.3x** |
 | Qwen3-8B (2+2 nodes, FSDP2 `dp_shard=8` x TP2) | **3.40 s** | 34.26 s | **10.1x** |
+| Qwen3-8B (2+2 nodes, HSDP `dp_replicate=2` x `dp_shard=4` x TP2) | **2.41 s** | 10.24 s | **4.2x** |
 | Qwen3-8B (1+1 nodes, 50 steps sustained) | **3.00 s** | 11.00 s | 3.7x |
 | Qwen3-30B-A3B MoE (2+2 nodes, FSDP2 x EP8, efsdp=2) | **8.07 s** | 43.43 s | **5.4x** |
 | Qwen3-0.6B (1 node, intra-node NVLink) | 0.59 s | 0.61 s | 1.0x |
@@ -191,6 +192,16 @@ so grouping experts into one fused stack does not make their weights change any 
 than a dense layer's; its smaller speedup is the payload growing with parameter count
 (1513 MB against 415 MB) while the broadcast stays near flat. The 0.6B row marks the low end
 honestly -- a 1.2 GB broadcast over NVLink is already cheap, so there is no speedup to have.
+
+The HSDP row was measured on a different day and its speedup is not comparable to the rows
+above; the delta and ``nccl`` runs in it are, since they ran back to back on the same nodes.
+That batch of nodes was roughly three times faster end to end (55 s per step against 183 s),
+and the full broadcast collected most of that -- it is bandwidth-bound -- while a 419 MB delta
+is small enough to be dominated by fixed overhead, so the ratio narrows. What the row is
+actually evidence for is that adding replicas changes nothing about the payload: 0.895% and
+419.3 MB against the TP2 row's 0.884% and 414.2 MB, agreeing step by step. That is what a
+correctly skipped replica looks like -- a replicate dim changes who reports an element, not
+how many of them moved.
 
 Correctness evidence (details in the PR):
 
