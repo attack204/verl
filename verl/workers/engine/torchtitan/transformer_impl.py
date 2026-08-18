@@ -369,8 +369,18 @@ class TorchTitanEngine(BaseEngine):
         raise NotImplementedError
 
     def _get_data_parallel_mesh(self):
-        """Get the data parallel mesh, handling hybrid/fully/replicate shard modes."""
-        mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
+        """Get the data parallel mesh, handling hybrid/fully/replicate shard modes.
+
+        It has to come back one-dimensional: both callers immediately ask it for
+        ``get_local_rank()`` or ``get_group()``, and a multi-dim mesh refuses both
+        unless told which dim. HSDP is the layout that has two of them, and asking
+        for ``["dp_replicate", "fsdp"]`` is what used to produce one. torchtitan
+        already publishes the flattened axis: ``loss`` is
+        ``dp_replicate * dp_shard * cp``, which is the same rank set in the same
+        order, since ``fsdp`` is ``dp_shard * cp``. The two fallbacks below still
+        cover the configurations where that axis is a singleton.
+        """
+        mesh = self.parallel_dims.get_optional_mesh("loss")
         if mesh is None:
             mesh = self.parallel_dims.get_optional_mesh("fsdp")
         if mesh is None:
