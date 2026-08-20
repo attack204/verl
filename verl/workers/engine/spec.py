@@ -88,10 +88,7 @@ class ShardSpec:
     # ``to_hf_chunk``) the engine can convert on the SENDER side: every rank
     # converts only its own touched dim-0 rows and ships final HF-coordinate
     # entries keyed by slot index -- rank 0 does no conversion at all.
-    # WITHOUT ``to_hf_chunk`` the split is the identity: one slot per dim-0 row,
-    # slot ``e`` is exactly ``full[e]`` with values untouched (torchtitan's fused
-    # expert stack -> one HF weight per expert). That case needs no converter and
-    # no probe, so ``_hf_entry_row_slots`` handles it with plain index math.
+    # Without ``to_hf_chunk`` the split is the identity: slot ``e`` is ``full[e]``, handled by index math.
     hf_slots: Optional[list[tuple[str, tuple]]] = None
 
     @classmethod
@@ -153,31 +150,14 @@ class BlockPlacement:
 
 
 def _shard_dim(p) -> Optional[int]:
-    """Which tensor dim this placement cuts, or None if it cuts none.
-
-    ``p.is_shard()`` is not enough: ``_StridedShard`` moved to C++ in torch 2.13
-    and stopped subclassing ``Shard``, so it answers False there while still
-    cutting a dim. Getting this wrong is silent -- the mesh dim drops out of
-    ``shard_dims``, the gather group shrinks to the remaining dims, and the ranks
-    left out lose their contributions with no error. Both types expose ``.dim``.
-    """
+    """Which tensor dim this placement cuts, or None. ``is_shard()`` misses ``_StridedShard`` on torch 2.13."""
     if p.is_shard():
         return int(p.dim)
     return int(p.dim) if type(p).__name__ == "_StridedShard" else None
 
 
 def _assert_even_strided(spec: ShardSpec, placements: tuple) -> None:
-    """Strided offsets are only valid when the cut divides evenly.
-
-    Once any placement is strided, ``compute_local_shape_and_global_offset``
-    switches every tensor dim over to ``offset = local_shape * shard_idx``, which
-    assumes all shards are the same size -- so the check covers all of them, not
-    just the strided dim. Plain Shard placements never take that branch and keep
-    working unevenly, which is why this returns early without one. torch guards
-    this at DTensor construction ("_StridedShard currently only allows even
-    sharding"), but that guard is theirs to relax, and if it ever is, the failure
-    here would be a wrong offset rather than an exception -- so check it too.
-    """
+    """Strided offsets assume equal shards, and switch every tensor dim to that rule -- so check them all."""
     if not any(type(p).__name__ == "_StridedShard" for p in placements):
         return
     cuts: dict[int, int] = {}
@@ -238,20 +218,12 @@ def derive_dtensor_placement(spec: ShardSpec) -> tuple[int | BlockPlacement, boo
       contribute and the gather group is the Shard dim's subgroup; the FSDP2
       default ``Shard(0)`` yields a flat-contiguous block, which keeps the add
       fast path in :func:`translate_flat_indices`. With several Shard dims (e.g.
-      automodel's EP x FSDP ``(Shard(0), Shard(1))`` expert mesh, or FSDP2 x TP
-      cutting the same dim twice) every rank holds a distinct block and the
-      gather group spans every Shard dim at once (:func:`_shard_dims_group`).
-      Replicate dims may sit beside them -- that is HSDP combined with TP or EP
-      -- and behave exactly as they do next to a single Shard dim: the replicas
-      do not contribute, and the group holds their coordinate fixed instead of
-      spanning them.
+      automodel's EP x FSDP ``(Shard(0), Shard(1))`` expert mesh) every rank holds
+      a distinct block and the gather group spans every Shard dim at once; a
+      Replicate dim beside them is held fixed rather than spanned.
 
-    ``_StridedShard`` (FSDP2 sharding a dim TP already cut) is a block too: it
-    encodes the right-to-left cut order, which permutes WHICH block a rank gets
-    rather than interleaving the block itself, and
-    ``compute_local_shape_and_global_offset`` already returns the permuted
-    offset. It only holds for an even cut, which :func:`_assert_even_strided`
-    checks.
+    ``_StridedShard`` is a block too: it permutes which block a rank gets, and
+    ``compute_local_shape_and_global_offset`` returns the permuted offset.
     """
     import torch.distributed as dist
 
@@ -288,27 +260,7 @@ _GATHER_GROUPS: dict[tuple, ProcessGroup] = {}
 
 
 def _shard_dims_group(mesh: DeviceMesh, shard_dims: list[int]) -> ProcessGroup:
-    """The group holding one copy of every block: the ranks reached by varying the
-    Shard mesh dims, with this rank's coordinate held fixed on the others.
-
-    That is exactly what ``mesh.get_group(mesh_dim=d)`` gives for a single Shard
-    dim, generalised to several at once; when the Shard dims are the only ones,
-    it is the whole mesh.
-
-    Holding the other dims fixed is what keeps HSDP from paying for its replicas.
-    A Replicate dim beside the Shard dims already contributes nothing (see
-    ``contributes``), so a group spanning it would still gather the right answer
-    -- but ``gather_slot_entries_to_rank0`` pads every rank's blob to the largest
-    one, so the replicate degree would be charged in wire bytes and in rank 0's
-    staging buffers for blobs that are empty by construction.
-
-    Groups are cached by rank set and created on every rank, since
-    ``dist.new_group`` is collective: the combos are walked in a fixed order and
-    every trainer rank walks the export in the same order, which keeps the calls
-    -- and therefore the cache -- in lockstep. Each group's rank 0 is its
-    smallest global rank, so the gathered result lands on the engine master
-    whenever the master is one of its members.
-    """
+    """The ranks reached by varying the Shard mesh dims, with this rank's coordinate fixed on the others."""
     import itertools
 
     import torch.distributed as dist

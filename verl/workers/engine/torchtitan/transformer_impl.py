@@ -65,25 +65,7 @@ from ..utils import enable_full_determinism, postprocess_batch_func, prepare_mic
 
 
 def _hf_entry_row_slots(name, spec, place, lidx, lval):
-    """Dim-0 identity slot profile: the logical tensor's dim 0 enumerates HF
-    tensors and the split copies values verbatim, so slot ``e`` IS ``full[e]``
-    and a full-tensor position's slot is one divmod away. A fused expert stack
-    ``(num_experts, *, *)`` is the case this exists for: torchtitan's adapter
-    splits it into one HF weight per expert with no reshape and no transpose.
-
-    Why not veomni's ``to_hf_chunk`` probe path: that one re-runs the backend's
-    converter on every touched dim-0 row because the conversion is an opaque
-    callable. Here it is known to be a slice, so the whole entry is a handful of
-    vectorized ops -- which matters, since a 128-expert model has one such row
-    per (layer, w1/w2/w3) and the probe path would be ~128 conversions each.
-
-    Relies on ``translate_flat_indices`` being monotonic (it is: local flat order
-    walks a block in row-major, which is increasing in full-tensor row-major
-    order), so positions arrive already grouped by slot and one ``searchsorted``
-    recovers the run lengths. Were that to stop holding, elements would land in a
-    neighbouring expert, which is what the export test's byte-exact per-HF-tensor
-    comparison fails on.
-    """
+    """Dim-0 identity slot profile: slot ``e`` IS ``full[e]``, so a position's slot is one divmod away."""
     from ..spec import translate_flat_indices
     from ..utils import _prodshape
 
@@ -101,8 +83,7 @@ def _hf_entry_row_slots(name, spec, place, lidx, lval):
     row_numel = max(_prodshape(spec.full_shape[1:]), 1)
     gidx = translate_flat_indices(lidx, place)
     edges = torch.arange(n_slots + 1, device=gidx.device, dtype=gidx.dtype) * row_numel
-    # One D2H for the run lengths. The diff's nonzero already synced this stream,
-    # and counts have to reach the host inside the gather anyway.
+    # One D2H for the run lengths; the diff's nonzero already synced this stream.
     counts = torch.searchsorted(gidx, edges).diff().cpu()
     return slots, dtype_str, counts, (gidx % row_numel).to(torch.int32), lval
 
@@ -369,17 +350,7 @@ class TorchTitanEngine(BaseEngine):
         raise NotImplementedError
 
     def _get_data_parallel_mesh(self):
-        """Get the data parallel mesh, handling hybrid/fully/replicate shard modes.
-
-        It has to come back one-dimensional: both callers immediately ask it for
-        ``get_local_rank()`` or ``get_group()``, and a multi-dim mesh refuses both
-        unless told which dim. HSDP is the layout that has two of them, and asking
-        for ``["dp_replicate", "fsdp"]`` is what used to produce one. torchtitan
-        already publishes the flattened axis: ``loss`` is
-        ``dp_replicate * dp_shard * cp``, which is the same rank set in the same
-        order, since ``fsdp`` is ``dp_shard * cp``. The two fallbacks below still
-        cover the configurations where that axis is a singleton.
-        """
+        """Get the data parallel mesh, handling hybrid/fully/replicate shard modes."""
         mesh = self.parallel_dims.get_optional_mesh("loss")
         if mesh is None:
             mesh = self.parallel_dims.get_optional_mesh("fsdp")
@@ -560,15 +531,7 @@ class TorchTitanEngine(BaseEngine):
             offload_fsdp_optimizer(self.optimizer)
 
     def _to_hf_named_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Re-key a torchtitan state dict to HuggingFace names, values untouched.
-
-        Shared by the full export and the sharded one so that both agree on exactly
-        which HF tensors exist. That is a correctness requirement, not tidiness: the
-        delta path pairs the two by name -- the seed ships full tensors, every later
-        step ships a diff against them -- so a name in one set but not the other
-        either leaves a weight frozen at its seed value on the rollout side or trips
-        the missing-snapshot assert, and neither says why.
-        """
+        """Re-key a torchtitan state dict to HuggingFace names, values untouched."""
         # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
         sd_adapter = self.checkpointer.sd_adapter
         if sd_adapter is not None:
@@ -583,19 +546,7 @@ class TorchTitanEngine(BaseEngine):
         return params
 
     def _expert_stack_slots(self, name: str, param: Any) -> Optional[list[tuple[str, tuple]]]:
-        """If ``name`` is a fused expert stack, enumerate the HF tensors it holds.
-
-        The discriminator is structural rather than a name pattern: the adapter's
-        map sends this one torchtitan key to an HF template with a SECOND ``{}``
-        (the expert id), which is exactly what "one weight here becomes many
-        weights there" looks like. Returns ``None`` for ordinary params.
-
-        The enumeration covers ALL experts, not the locally owned ones. That is
-        the whole point -- ``to_hf`` names only the local experts, so a rank that
-        trusted it would disagree with its neighbours about which HF tensors even
-        exist. Every rank can name all of them because the count is just the
-        stack's dim 0, which is a shape, identical everywhere.
-        """
+        """If ``name`` is a fused expert stack, enumerate ALL its experts' HF tensors, else ``None``."""
         sd_adapter = self.checkpointer.sd_adapter
         from_hf_map = getattr(sd_adapter, "from_hf_map", None) if sd_adapter is not None else None
         if not from_hf_map or param.ndim < 2:
@@ -609,14 +560,7 @@ class TorchTitanEngine(BaseEngine):
         return [(hf_template.format(layer_id, e), slot_shape) for e in range(int(param.shape[0]))]
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
-        """Build one parameter's final HF-coordinate delta entry.
-
-        Two shapes of parameter reach here. A fused expert stack carries
-        ``hf_slots`` and stands for one HF tensor per dim-0 row. Everything else
-        is an identity param: ``_to_hf_named_params`` already gave it its HF name
-        and the adapter left its values alone, so shard-local coordinates
-        translate straight through.
-        """
+        """Build one parameter's final HF-coordinate delta entry: expert stack via slots, else identity."""
         from ..utils import _hf_entry_identity
 
         if spec.hf_slots is not None:
@@ -628,15 +572,7 @@ class TorchTitanEngine(BaseEngine):
         return _hf_entry_identity(name, spec, place, lidx, lval)
 
     def get_per_tensor_param_delta_shard(self, **kwargs):
-        """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
-        ``(slots, dtype_str, counts, hf_idx, hf_val, gather_group)`` per parameter.
-
-        Weight->HF naming, to-HF conversion, diff and snapshot are all backend
-        business: the DTensor-generic pipeline lives in
-        :mod:`verl.workers.engine.utils`, the per-param entry builder is the
-        :meth:`_hf_delta_entry` hook. Requires a prior
-        :meth:`prime_delta_snapshots` call.
-        """
+        """Yield FINAL HF-coordinate delta entries per parameter; needs a prior :meth:`prime_delta_snapshots`."""
         from ..utils import hf_delta_export
 
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
@@ -644,17 +580,7 @@ class TorchTitanEngine(BaseEngine):
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
     def _assert_shard_export_supported(self) -> None:
-        """Reject the one parallelism layout whose local shard is not a block.
-
-        The sharded export hands the DTensor placements straight to
-        :func:`~verl.workers.engine.spec.derive_dtensor_placement`, which can only
-        describe a local shard that is one hyper-rectangular block of the full
-        tensor, gathered over a group it can name. FSDP2 -- with or without HSDP
-        replicate, with CP folded into the ``fsdp`` mesh dim, and with or without
-        TP or EP -- always is. PP is not, and fixing that needs work beyond
-        placement math, so it is named here rather than surfacing as a placement
-        error midway through the export.
-        """
+        """Reject PP, the one layout whose local shard is not a block; every FSDP2 layout is one."""
         pd = self.parallel_dims
         if pd.pp_enabled:
             raise NotImplementedError(
@@ -663,39 +589,16 @@ class TorchTitanEngine(BaseEngine):
                 "identical across ranks the way the delta engine's lockstep gather requires "
                 f"(pipeline_parallel_size={pd.pp})"
             )
-        # Nothing else needs naming here. TP: a column-parallel weight (FSDP2
-        # cutting the dim TP already cut) is a _StridedShard, which is still one
-        # block, and a row-parallel one cuts a different dim so it is a plain
-        # second Shard. EP is the same shape of fact one dim over -- it cuts the
-        # expert dim and EFSDP cuts it again, so a routed expert weight is another
-        # _StridedShard(0)Shard(0) block. What EP does need is the slot table
-        # (to_hf names only the local experts), which get_per_tensor_param_shard
-        # ships with the fused stack. HSDP replicate on top of either is just a
-        # Replicate dim beside those two Shard dims: the replicas keep lockstep
-        # with an empty delta and the gather group holds their coordinate fixed.
-        # derive_dtensor_placement handles all of these.
+        # TP, EP and HSDP replicate all stay blocks, so derive_dtensor_placement handles them.
 
     def get_per_tensor_param_shard(self, **kwargs):
-        """Like :meth:`get_per_tensor_param`, but yields this rank's *local* FSDP2
-        shard ``(hf_name, local_flat_bf16, ShardSpec)`` instead of all-gathering the
-        full tensor, so the delta engine can diff and gather only what changed.
-
-        No collectives and no full-tensor staging: torchtitan is always FSDP2, whose
-        ``state_dict()`` only collects DTensor references, and each shard is moved
-        (and cast) lazily as the generator is consumed -- which is what keeps a CPU
-        offload policy from having to page the whole model in.
-        """
+        """Yield this rank's *local* shard ``(hf_name, local_flat_bf16, ShardSpec)`` instead of the full tensor."""
         self._assert_shard_export_supported()
         raw = {}
         for module in self.module:
             raw.update(module.state_dict())
 
-        # A fused expert stack is exported WHOLE, carrying a slot table that names
-        # every expert's HF tensor. Running it through to_hf instead would yield
-        # the locally owned experts only -- a different name set on each EP rank,
-        # which is precisely what the gather's lockstep cannot survive. Ordinary
-        # params still go through to_hf so their naming stays byte-identical to
-        # the full export's.
+        # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
         stacks = {}
         for name, param in raw.items():
             slots = self._expert_stack_slots(name, param)
@@ -708,8 +611,7 @@ class TorchTitanEngine(BaseEngine):
 
         def _shard(param):
             p = param.to(device, non_blocking=True)
-            # The wire (and the rollout side) speak bf16; mixed precision keeps
-            # fp32 master weights, so cast before the diff sees them.
+            # The wire speaks bf16, but mixed precision keeps fp32 masters: cast before the diff sees them.
             if p.is_floating_point():
                 p = p.to(torch.bfloat16, non_blocking=True)
             local = p.to_local() if isinstance(p, DTensor) else p
@@ -718,8 +620,7 @@ class TorchTitanEngine(BaseEngine):
         def _gen():
             for name, param in params.items():
                 yield name, _shard(param), ShardSpec.from_param(param)
-            # Keyed by the torchtitan name: these entries are the stack, not any
-            # one HF tensor, and the snapshot dict this feeds is per exported shard.
+            # Keyed by the torchtitan name: the entry is the stack, not any one HF tensor.
             for name, slots in stacks.items():
                 spec = ShardSpec.from_param(raw[name])
                 spec.hf_slots = slots
@@ -740,16 +641,7 @@ class TorchTitanEngine(BaseEngine):
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
 
-        # A fused expert stack has to be made whole BEFORE it is split into one HF
-        # weight per expert. sd_adapter.to_hf() does it the other way round and
-        # keeps only the locally owned experts, so on a mesh where the expert dim
-        # is cut by more than one dim it silently drops the rest: gathering the
-        # split pieces over the ``ep`` group alone recovers ep/(efsdp*ep) of them,
-        # e.g. 32 of 64 experts at ep=4 efsdp=2. Letting the stack's own DTensor
-        # gather itself is both simpler and placement-agnostic -- EP, EFSDP and any
-        # replicate dim beside them are already encoded in its placements. The slot
-        # table is the one the sharded export uses, which is what keeps the two
-        # exports naming an identical set of HF tensors.
+        # Gather the stack before splitting it: to_hf splits first and drops every expert EFSDP holds elsewhere.
         stacks = {}
         for name, param in params.items():
             slots = self._expert_stack_slots(name, param)
@@ -768,8 +660,7 @@ class TorchTitanEngine(BaseEngine):
                     yield name, param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
                 else:
                     yield name, param
-            # One stack at a time: the gathered (num_experts, ...) tensor is the
-            # peak allocation here, and holding several at once would multiply it.
+            # One stack at a time: the gathered (num_experts, ...) tensor is the peak allocation here.
             for stack, slots in expert_stacks:
                 full = stack.to(device, non_blocking=True)
                 if isinstance(full, DTensor):

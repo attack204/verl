@@ -13,36 +13,7 @@
 # limitations under the License.
 """Validate the torchtitan engine's sharded delta export against its full export.
 
-The model is a real torchtitan Qwen3, parallelized by torchtitan's own
-``parallelize_fn`` and re-keyed by its own state dict adapter, so the DTensor
-placements and HF names under test are the ones a real run produces. The engine
-methods under test are the real ones -- only the training loop around them is
-stubbed out. Two things are asserted per layout: that the gathered sparse delta
-is byte-identical to the full export's diff, and that the two exports account
-for the same set of HF tensors -- a name in one and not the other would freeze
-a weight at its seed value without ever raising.
-
-The TP and EP layouts are load-bearing rather than decorative, and their failure
-mode is silent: read ``_StridedShard`` the naive way and every rank still
-produces the right block, the gather just collects two of them, so nothing
-raises and the values are merely wrong. Patching ``_shard_dim`` back to
-``p.is_shard()`` is the negative control -- it turns fsdp+tp red (18 parameters)
-and leaves fsdp / hsdp / fsdp+cp green, which is what says those cases test the
-strided path rather than pass alongside it.
-
-The layouts that put a replicate dim beside two cut dims come in two halves, and
-the controls separate them. Gathering over the whole mesh instead of one replica
-of it still passes -- the replicas contribute nothing either way -- so the
-per-replica group is a cost argument, and its membership is pinned by the size
-assertion in test_sharded_delta_gather rather than by any value here. Doing that
-AND letting every replica contribute turns exactly hsdp+tp (34 parameters) and
-hsdp+ep (1536) red, while plain hsdp and every layout without replicas stays
-green: with one cut dim the gather group already excludes the replicate dim, so
-the double count only becomes reachable once a second dim is cut. Both halves
-live in ``tools/negctl_hsdp_replicas.py``; worth rerunning all of these if the
-placement math is ever refactored.
-
-    torchrun --nproc_per_node=8 tests/special_distributed/test_torchtitan_delta_export.py
+torchrun --nproc_per_node=8 tests/special_distributed/test_torchtitan_delta_export.py
 """
 
 from types import SimpleNamespace
@@ -62,12 +33,7 @@ MOE_FLAVOR = "debugmodel_moe"
 
 
 class _ExportOnlyEngine(TorchTitanEngine):
-    """A TorchTitanEngine cut down to what the weight-export path reads.
-
-    The export touches nothing but the model parts, the checkpointer's state dict
-    adapter and the parallel dims, so bypassing ``__init__`` keeps the real methods
-    under test without standing up a trainer, an optimizer or a dataloader.
-    """
+    """A TorchTitanEngine cut down to what the weight-export path reads."""
 
     def __init__(self, module, sd_adapter, parallel_dims):
         self.module = module
@@ -87,11 +53,7 @@ def _build_sharded_model(parallel_dims, flavor=None):
         pipeline_parallel_degree=parallel_dims.pp,
         expert_parallel_degree=parallel_dims.ep,
     )
-    # TP is applied per module from a sharding_config that the model config only
-    # grows once it has seen the parallelism config -- the trainer does this for
-    # real runs. Skip it and parallelize_fn still builds the tp mesh dim, but every
-    # weight stays replicated across it, so a TP case would pass without ever
-    # sharding a tensor two ways.
+    # Without this the tp mesh dim still exists but every weight stays replicated across it.
     spec.model.update_from_config(config=SimpleNamespace(parallelism=parallelism))
     with torch.device("cuda"):
         model = spec.model.build()
@@ -116,15 +78,7 @@ def _full_export(engine):
 
 
 def _perturb(model, shard_coord, step):
-    """Nudge a sparse subset of every local shard, as an optimizer step would.
-
-    Each shard touches different positions, so the gather has to stitch
-    contributions from all of them: the exact thing that silently produced a
-    partial result when a placement was misread. The seed is the *shard* coordinate
-    rather than the global rank so that HSDP replicas of one shard stay identical,
-    which is the invariant a real optimizer step preserves and the one the
-    replica-skipping side of the export relies on.
-    """
+    """Nudge a sparse subset of every local shard; seeded by shard coord so HSDP replicas stay identical."""
     g = torch.Generator(device="cuda").manual_seed(1234 + 97 * step + shard_coord)
     with torch.no_grad():
         for p in model.parameters():
@@ -139,14 +93,7 @@ def _perturb(model, shard_coord, step):
 
 
 def _adamw_stepper(model):
-    """A step function that takes a real AdamW step on the DTensor parameters.
-
-    The sparse perturbation above is the easy regime for a delta: few positions, all
-    inside one shard. A real step moves nearly every element, so this is the case
-    where a wrong index lands inside the valid range instead of out of it, and where
-    the fp32-master-to-bf16 cast decides what counts as changed at all. Gradients are
-    seeded by shard coordinate for the same reason the perturbation is.
-    """
+    """A real AdamW step on the DTensor parameters: the dense regime, where a wrong index still lands in range."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
     def _step(model, shard_coord, step):
@@ -165,8 +112,7 @@ def _adamw_stepper(model):
 
 
 def _gather_delta_to_rank0(engine):
-    """Consume the delta export the way the delta engine does: every rank walks the
-    entries in lockstep and joins each gather; rank 0 keeps the assembled result."""
+    """Consume the delta export the way the delta engine does: lockstep gathers, rank 0 keeps the result."""
     gen, _ = engine.get_per_tensor_param_delta_shard()
     out = {}
     for slots, _dtype_str, counts, hf_idx, hf_val, pg in gen:
@@ -179,8 +125,7 @@ def _gather_delta_to_rank0(engine):
 
 
 def _compare(name, sharded, full_before, full_after):
-    """A parameter passes when the gathered sparse delta is byte-identical to the
-    diff of the full tensors before and after the step."""
+    """A parameter passes when the gathered delta is byte-identical to the full tensors' before/after diff."""
     idx, val = sharded
     fb, fa = full_before[name], full_after[name]
     int_view = {2: torch.int16, 4: torch.int32}[fa.element_size()]
@@ -195,17 +140,7 @@ def _compare(name, sharded, full_before, full_after):
 
 
 def _test_delta_matches_full(engine, model, shard_coord, rank, tag, step_fn, steps=2):
-    """Seed, then take several steps, checking each step's delta against the full diff.
-
-    Also keeps a rollout-side reconstruction: the seed's full tensors with every
-    step's delta scattered into them, which is what the receiver ends up holding.
-    Comparing that to the trainer's own weights closes the loop -- a delta can match
-    a single step's diff and still drift if its coordinates are off relative to the
-    HF tensor, or if the snapshot bookkeeping slips.
-
-    More than one step on purpose: a delta export that forgets to refresh its
-    snapshot still passes the first step and diverges from then on.
-    """
+    """Seed, then step repeatedly, checking each delta against the full diff and the replica against the weights."""
     engine.prime_delta_snapshots()
     replica = _full_export(engine)  # what the seed sync hands the rollout side
     ok = True
@@ -243,12 +178,7 @@ def _test_delta_matches_full(engine, model, shard_coord, rank, tag, step_fn, ste
 
 
 def _shard_export_slot_names(engine):
-    """The HF tensors the sharded export accounts for.
-
-    Usually one per entry, the entry's own name. A fused expert stack is the
-    exception: it is exported whole under its torchtitan name and its slot table
-    names the per-expert HF tensors it carries, so the stack contributes E names
-    and none of them is the entry's."""
+    """The HF tensors the sharded export accounts for: the entry's name, or an expert stack's E slot names."""
     names = []
     for name, _local, spec in engine.get_per_tensor_param_shard()[0]:
         names.extend([n for n, _shape in spec.hf_slots] if spec.hf_slots else [name])
@@ -256,10 +186,7 @@ def _shard_export_slot_names(engine):
 
 
 def _test_export_names_agree(engine, rank):
-    """The full and the sharded export must account for the same HF tensors: the
-    delta path pairs them by name, so a mismatch means a weight the rollout never
-    updates. Compared as sets -- the sharded export groups the expert stacks at the
-    end of its stream, and nothing downstream reads the two in step."""
+    """Both exports must name the same HF tensor set, else a weight is never updated; compared unordered."""
     full_names = [name for name, _ in engine.get_per_tensor_param()[0]]
     shard_names = _shard_export_slot_names(engine)
     ok = sorted(full_names) == sorted(shard_names) and len(set(shard_names)) == len(shard_names)
@@ -273,8 +200,7 @@ def _test_export_names_agree(engine, rank):
 
 
 def _test_unsupported_layouts_rejected(world, rank):
-    """PP must be named at the export boundary, not surface later as a placement
-    error or, worse, a wrong translation."""
+    """PP must be named at the export boundary, not surface later as a placement error or a wrong translation."""
     cases = {}
     if world % 2 == 0:
         cases["pp"] = dict(dp_shard=world // 2, dp_replicate=1, cp=1, tp=1, pp=2, ep=1)
@@ -293,34 +219,7 @@ def _test_unsupported_layouts_rejected(world, rank):
 
 
 def _layouts(world):
-    """The layouts the sharded export claims to support, as (tag, flavor, kwargs).
-
-    HSDP earns its place: the replicate dim makes several ranks hold the same shard,
-    and every one of them contributing would double-count. CP earns its place
-    because the claim that it needs no special handling rests on torchtitan folding
-    it into the ``fsdp`` mesh dim -- worth checking rather than asserting. TP earns
-    its place because it is the only layout where two mesh dims cut the SAME tensor
-    dim: torchtitan's column-parallel weights come back as _StridedShard, whose
-    block is placed by a right-to-left rank order, while its row-parallel ones cut a
-    second dim and its norms stay replicated -- three different geometries in one
-    model, and the export has to read all three off the same placements.
-
-    EP needs the MoE flavor and needs to be run at more than one degree. The
-    geometry is the same same-dim double cut as column-parallel TP, one dim over
-    (EP cuts the expert dim, EFSDP cuts it again), but the naming is not: the
-    stack is one exported entry standing for E HF tensors, and how the experts
-    divide between the two mesh dims changes with the degree. ep=1 is in the list
-    on purpose -- it is the degenerate geometry, and the slot table has to be
-    right there too, since a MoE model trained without EP still fuses its experts.
-
-    HSDP x TP and HSDP x EP are the two combined layouts: a replicate dim beside
-    two cut dims. They add no new block geometry -- a replicate dim shifts no
-    offset -- so what they exercise is the gather group, which has to span the
-    two cut dims and stop there rather than spanning the mesh. Whether it does is
-    invisible in the values (the replicas contribute nothing either way), so the
-    membership is asserted directly in test_sharded_delta_gather; here the check
-    is that the export as a whole still reproduces the full one.
-    """
+    """The layouts the sharded export claims to support, as (tag, flavor, kwargs)."""
     out = [("fsdp", FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=1))]
     if world % 2 == 0:
         out.append(("hsdp", FLAVOR, dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1, ep=1)))
@@ -329,8 +228,7 @@ def _layouts(world):
         out.append(("moe+ep1", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=1)))
         out.append(("moe+ep2", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=2)))
         out.append(("moe+ep_full", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=world)))
-        # dp_shard // 2 experts' worth of EFSDP beside EP, so the stack really is
-        # cut on two dims and not just by ep
+        # EFSDP beside EP, so the stack really is cut on two dims and not just by ep
         out.append(("hsdp+ep", MOE_FLAVOR, dict(dp_shard=world // 2, dp_replicate=2, cp=1, tp=1, ep=2)))
     if world % 4 == 0:
         out.append(("moe+ep4", MOE_FLAVOR, dict(dp_shard=world, dp_replicate=1, cp=1, tp=1, ep=4)))
