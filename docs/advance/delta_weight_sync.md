@@ -128,28 +128,14 @@ FSDP versions and TorchTitan provide:
   machinery, so the whole-shard GPU staging round trip is kept for it (it is skipped for FSDP2).
   Single-GPU FSDP1 uses ``FULL_STATE_DICT`` (plain tensors) and degrades to the replicated/rank-0 path —
   still correct, just not shard-parallel.
-- **TorchTitan** (``model_engine=torchtitan``): FSDP2 underneath, so the same ``Shard(0)`` params, with
-  the HF names coming from TorchTitan's own state dict adapter — for a dense model that adapter is a
-  pure rename, so the DTensors reach the export with their placements intact. HSDP replicate and
-  context parallelism need no special handling (TorchTitan folds CP into the ``fsdp`` mesh dim).
-  Tensor parallelism works too: a column-parallel weight has FSDP2 cutting the dim TP already cut,
-  which torch spells ``_StridedShard`` — still one block per rank, since the strided form permutes
-  which block a rank owns rather than interleaving it — and a row-parallel weight cuts a second dim
-  and is a plain second ``Shard``. Expert parallelism works as well. Its geometry is the same
-  same-dim double cut one dim over (EP cuts the expert dim of a routed expert stack, EFSDP cuts it
-  again), but its naming is not: the adapter turns one fused ``(num_experts, ...)`` stack into one
-  HF weight per expert and keeps only the locally owned ones, so ranks would disagree about which
-  HF tensors exist. The export therefore ships the stack whole with a slot table naming every
-  expert, and since the split is a plain dim-0 slice, a position's expert is one divmod away — no
-  per-expert conversion. HSDP replicate combines with either: a replicate dim beside the two cut
-  dims adds no new block geometry, and the gather group holds its coordinate fixed rather than
-  spanning it, so a replica is never asked for a block one of its peers already sent. (HSDP
-  together with EP additionally needs a TorchTitan-side fix: its MoE state dict adapter reads
-  ``placement.dim`` before checking the placement type, so a replicate dim raises inside
-  ``to_hf()`` during checkpoint load, before training starts. That is independent of the delta
-  path — the export ships expert stacks whole and never calls ``to_hf()`` on them.) Pipeline
-  parallelism is the one layout rejected at the export boundary, because each stage holds a disjoint
-  slice of the model and the delta engine's gather is lockstep across ranks.
+- **TorchTitan** (``model_engine=torchtitan``): FSDP2 underneath, with HF names from TorchTitan's
+  own state dict adapter. HSDP replicate, CP, TP and EP all work — TP and EP cut a dim FSDP2 has
+  already cut, which torch spells ``_StridedShard`` but is still one block per rank, and a
+  replicate dim beside them is held fixed rather than spanned. EP differs in naming, not geometry:
+  ``to_hf()`` keeps only the locally owned experts, so the export ships the fused stack whole with
+  a slot table naming every one. HSDP with EP also needs a TorchTitan-side fix — its MoE adapter
+  reads ``placement.dim`` before checking the placement type, which raises at checkpoint load.
+  PP is rejected at the export boundary: its stages hold disjoint slices, and the gather is lockstep.
 
 Other shard dimensions than ``Shard(0)`` are not supported and raise.
 
@@ -177,8 +163,8 @@ materialization that grows linearly with parameter bytes, so the advantage widen
 and with MoE sparsity. The per-step changed ratio is ~1-3% of parameter bytes for dense models
 (0.02-0.05% for the 235B MoE early steps) and stays there over long runs.
 
-The TorchTitan engine was measured separately -- A100/A800 80GB, ``one_step_off_policy``
-(disaggregated), offload off -- so these are not directly comparable to the table above:
+The TorchTitan engine and verl's own FSDP engine (``model_engine=dp``) were measured separately --
+A100/A800 80GB, ``one_step_off_policy``, offload off -- so they are not comparable to the above:
 
 | model (trainer placement) | ``delta_sharded`` | ``nccl`` (full broadcast) | speedup |
 |---|---|---|---|
@@ -188,45 +174,14 @@ The TorchTitan engine was measured separately -- A100/A800 80GB, ``one_step_off_
 | Qwen3-8B (1+1 nodes, 50 steps sustained) | **3.00 s** | 11.00 s | 3.7x |
 | Qwen3-30B-A3B MoE (2+2 nodes, FSDP2 x EP8, efsdp=2) | **8.07 s** | 43.43 s | **5.4x** |
 | Qwen3-0.6B (1 node, intra-node NVLink) | 0.59 s | 0.61 s | 1.0x |
-
-Trainer TP costs the sync nothing measurable (3.40 s against 3.34 s): TP changes which rank
-holds which slice, not how many elements changed, and both runs agree to three digits on
-``changed_ratio``. The MoE row's 0.866% changed ratio sits within a hair of the 8B's 0.884%,
-so grouping experts into one fused stack does not make their weights change any differently
-than a dense layer's; its smaller speedup is the payload growing with parameter count
-(1513 MB against 415 MB) while the broadcast stays near flat. The 0.6B row marks the low end
-honestly -- a 1.2 GB broadcast over NVLink is already cheap, so there is no speedup to have.
-
-The HSDP row was measured on a different day and its speedup is not comparable to the rows
-above; the delta and ``nccl`` runs in it are, since they ran back to back on the same nodes.
-That batch of nodes was roughly three times faster end to end (55 s per step against 183 s),
-and the full broadcast collected most of that -- it is bandwidth-bound -- while a 419 MB delta
-is small enough to be dominated by fixed overhead, so the ratio narrows. What the row is
-actually evidence for is that adding replicas changes nothing about the payload: 0.895% and
-419.3 MB against the TP2 row's 0.884% and 414.2 MB, agreeing step by step. That is what a
-correctly skipped replica looks like -- a replicate dim changes who reports an element, not
-how many of them moved.
-
-The same A800 cluster also ran verl's own FSDP engine (``model_engine=dp``) on the config of
-the first TorchTitan row. The placement math in ``verl/workers/engine/spec.py`` is shared by
-every backend, so measuring only TorchTitan leaves the engine most users are on untested:
-
-| model (trainer placement) | ``delta_sharded`` | ``nccl`` (full broadcast) | speedup |
-|---|---|---|---|
 | Qwen3-8B (2+2 nodes, FSDP engine, FSDP2 ``fsdp_size=16``) | **2.24 s** | 38.58 s | **17.2x** |
 | Qwen3-8B (2+2 nodes, FSDP engine, FSDP1 ``fsdp_size=16``) | 24.86 s | 65.22 s | 2.6x |
 
-The useful comparison is not the speedup but the delta: the FSDP2 row and the TorchTitan
-``dp_shard=16`` row agree on 418.6 MB at 0.893% changed against 414.5 MB at 0.884%. Two engines
-with unrelated export implementations independently arriving at the same changed set is what
-says the shared placement math is right; a timing only ever describes one session on one set
-of pods.
-
-The FSDP1 row is the same config with the config note above ignored, kept because it answers
-the question it raises. An 11x sync gap at an equal payload is not the delta path: FSDP1's
-export pages the model back to GPU and goes through the unshard machinery on every sync, which
-FSDP2 skips by handing out DTensor references. The ``nccl`` baseline never touches the sharded
-delta path and still moved by 1.7x, from the same cause.
+Neither TP nor HSDP replicas change the payload (0.884%, 0.884% and 0.895% changed across the
+three 8B TorchTitan rows), and the FSDP engine lands independently on 0.893% for the same config:
+they change which rank reports an element, not how many moved. Speedups are per session -- the
+HSDP and FSDP rows ran on faster nodes, so compare each only to its own ``nccl`` baseline. FSDP1
+is the config note above ignored: its export pages the model back to GPU on every sync.
 
 Correctness evidence (details in the PR):
 
