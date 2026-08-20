@@ -207,6 +207,27 @@ actually evidence for is that adding replicas changes nothing about the payload:
 correctly skipped replica looks like -- a replicate dim changes who reports an element, not
 how many of them moved.
 
+The same A800 cluster also ran verl's own FSDP engine (``model_engine=dp``) on the config of
+the first TorchTitan row. The placement math in ``verl/workers/engine/spec.py`` is shared by
+every backend, so measuring only TorchTitan leaves the engine most users are on untested:
+
+| model (trainer placement) | ``delta_sharded`` | ``nccl`` (full broadcast) | speedup |
+|---|---|---|---|
+| Qwen3-8B (2+2 nodes, FSDP engine, FSDP2 ``fsdp_size=16``) | **2.24 s** | 38.58 s | **17.2x** |
+| Qwen3-8B (2+2 nodes, FSDP engine, FSDP1 ``fsdp_size=16``) | 24.86 s | 65.22 s | 2.6x |
+
+The useful comparison is not the speedup but the delta: the FSDP2 row and the TorchTitan
+``dp_shard=16`` row agree on 418.6 MB at 0.893% changed against 414.5 MB at 0.884%. Two engines
+with unrelated export implementations independently arriving at the same changed set is what
+says the shared placement math is right; a timing only ever describes one session on one set
+of pods.
+
+The FSDP1 row is the same config with the config note above ignored, kept because it answers
+the question it raises. An 11x sync gap at an equal payload is not the delta path: FSDP1's
+export pages the model back to GPU and goes through the unshard machinery on every sync, which
+FSDP2 skips by handing out DTensor references. The ``nccl`` baseline never touches the sharded
+delta path and still moved by 1.7x, from the same cause.
+
 Correctness evidence (details in the PR):
 
 - **200-step GRPO equivalence at 7B** (delta vs nccl, 400 syncs): reward trajectories track
