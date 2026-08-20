@@ -500,9 +500,6 @@ data:
     name: null
   return_multi_modal_inputs: true
   apply_chat_template_kwargs: {}
-  continuous_token:
-    enable: false
-    model_family: auto
   mm_processor_kwargs: {}
 critic:
   optim:
@@ -1000,4 +997,6 @@ skip:
 ray_kwargs:
   ray_init:
     num_cpus: null
+    runtime_env:
+      py_executable: null
   timeline_json_file: null
